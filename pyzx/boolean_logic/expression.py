@@ -78,6 +78,7 @@ class LogicExpressionGraph(GraphS):
             outputs.append(outp)
             g.add_edges([(z, h), (h, outp)])
         g.set_outputs(outputs)
+        raise NotImplementedError('Circuit extraction from ZH-diagrams is not yet implemented.')
         res = extract_circuit(g, *args, **kwargs)
         return res
 
