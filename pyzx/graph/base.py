@@ -607,10 +607,10 @@ class BaseGraph(Generic[VT, ET], metaclass=DocstringMeta):
             self.var_registry.set_type(name, other.var_registry.get_type(name))
         self.rebind_variables_to_registry()
 
-    def tensor(self, other: BaseGraph[VT,ET]) -> BaseGraph[VT,ET]:
+    def tensor(self, other: BaseGraph[VT,ET], copy=True) -> BaseGraph[VT,ET]:
         """Take the tensor product of two graphs. Places the second graph below the first one.
         Can also be called using the operator ``graph1 @ graph2``"""
-        g = self.copy()
+        g = self.copy() if copy else self
         g.scalar.mult_with_scalar(other.scalar)
         ts = other.types()
         qs = other.qubits()
@@ -646,23 +646,45 @@ class BaseGraph(Generic[VT, ET], metaclass=DocstringMeta):
 
         return g
 
-    def __iadd__(self, other: BaseGraph[VT,ET]) -> BaseGraph[VT,ET]:
-        self.compose(other)
-        return self
-
     def __add__(self, other: BaseGraph[VT,ET]) -> BaseGraph[VT,ET]:
         g = self.copy()
         g += other
         return g
 
+    def __radd__(self, other: BaseGraph[VT,ET]) -> BaseGraph[VT,ET]:
+        g = other.copy(backend=type(self).backend)
+        g += self
+        return g
+
+    def __iadd__(self, other: BaseGraph[VT,ET]) -> BaseGraph[VT,ET]:
+        self.compose(other)
+        return self
+
     def __mul__(self, other: BaseGraph[VT,ET]) -> BaseGraph[VT,ET]:
         """Compose two diagrams, in formula order. That is, g * h produces 'g AFTER h'."""
-        g = other.copy()
-        g.compose(self)
+        g = other.copy(backend=type(self).backend)
+        return g + self
+
+    def __rmul__(self, other: BaseGraph[VT,ET]) -> BaseGraph[VT,ET]:
+        """Compose two diagrams, in formula order. That is, g * h produces 'g AFTER h'."""
+        return self + other
+
+    def __imul__(self, other: BaseGraph[VT,ET]) -> BaseGraph[VT,ET]:
+        """Compose two diagrams, in formula order. That is, g * h produces 'g AFTER h'."""
+        g = other.copy(backend=type(self).backend)
+        g += self
         return g
 
     def __matmul__(self, other: BaseGraph[VT,ET]) -> BaseGraph[VT,ET]:
         return self.tensor(other)
+
+    def __rmatmul__(self, other: BaseGraph[VT,ET]) -> BaseGraph[VT,ET]:
+        g = other.copy(backend=type(self).backend)
+        return g.tensor(self)
+
+    def __imatmul__(self, other: BaseGraph[VT,ET]) -> BaseGraph[VT,ET]:
+        return self.tensor(other, copy=False)
+
 
     def merge(self, other: BaseGraph[VT,ET]) -> Tuple[List[VT],List[ET]]:
         """Merges this graph with the other graph in-place.
@@ -812,7 +834,7 @@ class BaseGraph(Generic[VT, ET], metaclass=DocstringMeta):
         """Converts the given .qgraph json string into a Graph.
         Works with the output of :meth:`to_json`."""
         from .jsonparser import json_to_graph
-        return json_to_graph(js)
+        return json_to_graph(js, cls.backend)
 
     @classmethod
     def from_tikz(cls, tikz: str, warn_overlap:bool= True, fuse_overlap:bool = True, ignore_nonzx:bool = False) -> BaseGraph[VT,ET]:

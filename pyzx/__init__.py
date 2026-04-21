@@ -47,6 +47,7 @@ from . import editor
 from . import routing
 from . import local_search
 from .routing.parity_maps import CNOT_tracker
+from . import boolean_logic
 
 # some common scalars
 from .graph.base import Scalar
