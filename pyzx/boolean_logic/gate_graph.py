@@ -1,4 +1,3 @@
-import re
 from functools import reduce
 
 from sympy.core.symbol import Symbol
@@ -6,7 +5,9 @@ from sympy.logic.boolalg import Boolean, BooleanFalse, BooleanTrue, Not, And, Or
 from sympy.parsing.sympy_parser import parse_expr as sympy_parse_expr
 
 from ..utils import VertexType, get_h_box_label, set_h_box_label
-from .expression import LogicExpressionGraph
+from ..simplify import id_simp
+from .expression_graph import LogicExpressionGraph
+from .expression import SymPyBooleanExpression
 
 
 class LogicGateGraph(LogicExpressionGraph):
@@ -17,7 +18,7 @@ class LogicGateGraph(LogicExpressionGraph):
 
 
     @classmethod
-    def from_string(cls, string):
+    def from_string(cls, string, simplify=False):
         """Parse a boolean expression string into a gate graph.
 
         Parameters
@@ -45,61 +46,30 @@ class LogicGateGraph(LogicExpressionGraph):
         >>> draw(g)
         """
 
-        if not isinstance(string, str):
-            raise TypeError(f'Input must be a string, got {type(string)}')
-
-        # Unify alternative operator representations
-        alt_operators = {
-            r'(?<![\w])0(?![\w])': 'false',
-            r'(?<![\w])1(?![\w])': 'true',
-            r'(?<![\w])not(?![\w])': '~',
-            '-': '~',
-            r'(?<![\w])and(?![\w])': '&',
-            r'\*': '&',
-            r'(?<![\w])or(?![\w])': '|',
-            r'\+': '|',
-            r'(?<![\w])xor(?![\w])': '^',
-        }
-        for op in alt_operators:
-            string = re.sub(op, alt_operators[op], string)
-
-        # Filter input string for valid characters because sympy_parse_expr uses eval()
-        character_whitelist = r'\w\s~&\|\^\(\)\[\]\{\}=<>'
-        if match := re.findall(f'[^{character_whitelist}]', string):
-            raise ValueError('String contains invalid characters: ' + ', '.join(match))
-
-        try:
-            expr = sympy_parse_expr(string)
-        except (ValueError, TypeError, SyntaxError) as e:
-            raise ValueError(f'Error parsing expression: {e}\nParser got input: "{string}"')
-        return cls.from_sympy(expr)
+        expr = SymPyBooleanExpression.from_string(string, simplify=simplify)
+        return cls.from_boolean_expression(expr)
 
 
     @classmethod
-    def from_sympy(cls, expr):
-        """Build a gate graph from a SymPy boolean expression.
+    def from_boolean_expression(cls, expr):
+        """Convert a boolean expression into a gate graph.
 
         Parameters
         ----------
-        expr : sympy.logic.boolalg.Boolean or sympy.core.symbol.Symbol
-            SymPy expression to convert.
+        expr : SymPyBooleanExpression
+            Boolean expression wrapper as returned by
+            :meth:`~pyzx.boolean_logic.SymPyBooleanExpression.from_string`.
 
         Returns
         -------
         LogicGateGraph
-            Graph equivalent of ``expr``.
+            Graph equivalent of the given boolean expression.
 
         Raises
         ------
-        TypeError
-            If ``expr`` is not a supported SymPy boolean type.
         ValueError
-            If ``expr`` contains unsupported SymPy functions.
+            If the expression contains unsupported SymPy boolean functions.
         """
-
-        if not isinstance(expr, (Boolean, Symbol)):
-            raise TypeError('Input must be a sympy boolean expression or symbol, got '
-                f'{type(expr)}')
 
         gate_map = {
             BooleanFalse: lambda args: ConstantGateGraph(False),
@@ -110,12 +80,11 @@ class LogicGateGraph(LogicExpressionGraph):
             Xor: lambda args: XorGateGraph(len(args)),
         }
 
+        # Template graph for symbol vertices
         symbol_graph = LogicGateGraph()
-        inp = symbol_graph.add_vertex(VertexType.BOUNDARY, 0, 0)
-        copy_spider = symbol_graph.add_vertex(VertexType.Z, 0, 1)
-        outp = symbol_graph.add_vertex(VertexType.BOUNDARY, 0, 2)
-        symbol_graph.add_edges([(inp, copy_spider), (copy_spider, outp)])
-        symbol_graph.set_inputs((inp,))
+        symbol_spider = symbol_graph.add_vertex(VertexType.Z, 0, 0)
+        outp = symbol_graph.add_vertex(VertexType.BOUNDARY, 0, 1)
+        symbol_graph.add_edges([(symbol_spider, outp)])
         symbol_graph.set_outputs((outp,))
 
         def _construct_gate(expr):
@@ -126,28 +95,29 @@ class LogicGateGraph(LogicExpressionGraph):
                 func_graph = gate_map[func](expr.args)
                 return func_graph * args_graph
             elif func is Symbol:
-                # Create copy spider associated with expression symbol
+                # Create symbol spider associated with expression symbol
                 g = symbol_graph.copy()
-                g.set_vdata(copy_spider, 'symbol', expr.name)
+                g.set_vdata(symbol_spider, 'symbol', expr.name)
                 return g
             else:
                 raise ValueError(f'Unsupported sympy function: {func}')
 
-        g = _construct_gate(expr)
-        # Connect all copy spiders associated with the same symbol
-        symbol_inputs, remove_vertices = dict(), list()
-        for v in g.vertices():
-            symbol = g.vdata(v, 'symbol')
-            if symbol:
-                if symbol in symbol_inputs:
-                    neighbor0, neighbor1 = list(g.neighbors(v))
-                    inp, other = (neighbor0, neighbor1) \
-                        if g.type(neighbor0) == VertexType.BOUNDARY else (neighbor1, neighbor0)
-                    g.add_edge((symbol_inputs[symbol], other))
-                    remove_vertices += [v, inp]
-                else:
-                    symbol_inputs[symbol] = v
-        g.remove_vertices(remove_vertices)
+        g = _construct_gate(expr.expr)
+        # Create inputs in the order of the expression variables and
+        # connect all symbol spiders associated with the same symbol
+        inp_qubit = min(g.qubit(v) for v in g.vertices())
+        inp_row = min(g.row(v) for v in g.vertices())
+        inputs = list()
+        for i, var in enumerate(expr.vars):
+            inp = g.add_vertex(VertexType.BOUNDARY, inp_qubit + i, inp_row - 1)
+            copy_spider = g.add_vertex(VertexType.Z, inp_qubit + i, inp_row)
+            inputs.append(inp)
+            g.add_edges([(inp, copy_spider)])
+            for v in [v for v in g.vertices() if g.vdata(v, 'symbol') == var.name]:
+                g.add_edges([(copy_spider, v)])
+                id_simp.apply(g, v)
+        g.set_inputs(inputs)
+
         return g
 
 

@@ -6,8 +6,10 @@ __all__ = [
     "AndGateGraph",
     "OrGateGraph",
     "XorGateGraph",
-    "LogicExpressionGraph"
+    "LogicExpressionGraph",
+    "SymPyBooleanExpression",
 ]
 
-from .basic_gate import LogicGateGraph, ConstantGateGraph, IdentityGateGraph, NotGateGraph, AndGateGraph, OrGateGraph, XorGateGraph
-from .expression import LogicExpressionGraph
+from .gate_graph import LogicGateGraph, ConstantGateGraph, IdentityGateGraph, NotGateGraph, AndGateGraph, OrGateGraph, XorGateGraph
+from .expression_graph import LogicExpressionGraph
+from .expression import SymPyBooleanExpression

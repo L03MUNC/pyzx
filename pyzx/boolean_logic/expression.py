@@ -1,157 +1,186 @@
+import re, itertools
+
 import numpy as np
 
-from ..utils import EdgeType, VertexType, get_h_box_label, set_h_box_label
-from ..graph.graph_s import GraphS
-from ..simplify import to_gh, full_reduce
-from ..hsimplify import zh_simp, had_edge_to_hbox_simp
-from ..extract import extract_circuit
+from sympy.core.symbol import Symbol
+from sympy.logic.boolalg import Boolean, BooleanFalse, BooleanTrue, Not, And, Or, Xor
+from sympy.parsing.sympy_parser import parse_expr, auto_symbol
 
 
-class LogicExpressionGraph(GraphS):
-    """Graph representation for boolean-logic expressions.
+class SymPyBooleanExpression:
+    """Wrap a SymPy boolean expression.
 
-    This backend extends :class:`GraphS` with helpers for ZH-form checks,
-    simplification, and circuit extraction.
+    Parameters
+    ----------
+    expr : sympy.logic.boolalg.Boolean or sympy.core.symbol.Symbol
+        Expression to wrap.
     """
 
-    backend = 'logic-expression'
-
-
-    def __init__(self, graph=None):
-        """Initialize a logic-expression graph.
+    def __init__(self, expr):
+        """Initialize the expression wrapper.
 
         Parameters
         ----------
-        graph : GraphS, optional
-            Graph whose structure is merged into this instance.
-        """
-
-        super().__init__()
-        if graph:
-            self @= graph
-
-
-    # Override reflective operators to prioritize LogicExpressionGraph instances when combined
-    # with instances of superclasses
-
-    def __radd__(self, other):
-        return super().__radd__(other)
-
-    def __rmul__(self, other):
-        return super().__rmul__(other)
-
-    def __rmatmul__(self, other):
-        return super().__rmatmul__(other)
-
-
-    def to_circuit(self, *args, **kwargs):
-        """Extract a circuit from the logic-expression graph.
-
-        Parameters
-        ----------
-        *args
-            Positional arguments forwarded to :func:`extract_circuit`.
-        **kwargs
-            Keyword arguments forwarded to :func:`extract_circuit`.
-
-        Returns
-        -------
-        Circuit
-            Circuit extracted from a prepared copy of the graph.
-        """
-
-        g = self.copy()
-        outputs = list(g.outputs())
-        outp_row = g.row(outputs[0])
-        lowest_qubit = min(
-            {
-                g.qubit(v)
-                for v in g.vertex_set()
-                if g.row(v) >= outp_row - 2 and g.row(v) <= outp_row
-            }
-        )
-
-        for i in range(1, g.num_inputs()):
-            z = g.add_vertex(VertexType.Z, lowest_qubit-i, outp_row-2)
-            h = g.add_vertex(VertexType.H_BOX, lowest_qubit-i, outp_row-1)
-            outp = g.add_vertex(VertexType.BOUNDARY, lowest_qubit-i, outp_row)
-            outputs.append(outp)
-            g.add_edges([(z, h), (h, outp)])
-        g.set_outputs(outputs)
-        raise NotImplementedError('Circuit extraction from ZH-diagrams is not yet implemented.')
-        res = extract_circuit(g, *args, **kwargs)
-        return res
-
-
-    def simplify(self):
-        """Simplify the graph with ZH rewrite rules.
-
-        Returns
-        -------
-        LogicExpressionGraph
-            The simplified graph instance.
+        expr : sympy.logic.boolalg.Boolean or sympy.core.symbol.Symbol
+            Expression to wrap.
 
         Raises
         ------
-        ValueError
-            If the graph is not in ZH form.
+        TypeError
+            If ``expr`` is not a SymPy boolean expression or symbol.
         """
 
-        if not self.is_zh():
-            raise ValueError('Graph must be a ZH-diagram to be simplified. Use to_zh() to convert '
-                'it first.')
-
-        zh_simp(self)
-        had_edge_to_hbox_simp(self)
-        return self
+        if not isinstance(expr, (Boolean, Symbol)):
+            raise TypeError('Input must be a sympy boolean expression or symbol, got '
+                f'{type(expr)}')
+        self._expr = expr
 
 
-    def is_zh(self):
-        """Check whether the graph is in ZH form.
+    @property
+    def expr(self):
+        """Return the wrapped SymPy expression.
 
         Returns
         -------
-        bool
-            ``True`` if all vertices and edges match the ZH constraints.
+        sympy.logic.boolalg.Boolean or sympy.core.symbol.Symbol
+            Wrapped expression.
         """
 
-        vtypes = set(self.types().values())
-        etypes = {self.edge_type(e) for e in self.edges()}
-        return vtypes.issubset(
-            {VertexType.BOUNDARY, VertexType.Z, VertexType.H_BOX}
-        ) and etypes.issubset(
-            {EdgeType.SIMPLE}
-        )
+        return self._expr
 
-
-    def to_zh(self):
-        """Convert a copy of the graph to ZH form.
+    @property
+    def vars(self):
+        """Return symbols used in the expression.
 
         Returns
         -------
-        LogicExpressionGraph
-            Converted graph in ZH-compatible form.
+        list[sympy.core.symbol.Symbol]
+            Free symbols sorted by name.
         """
 
-        g = self.copy()
-        to_gh(g)
-        had_edge_to_hbox_simp(g)
-        return g
+        return sorted(self._expr.free_symbols, key=lambda s: s.name)
 
 
-    @staticmethod
-    def validate(graph):
-        """Validate whether a graph can be used as a logic expression.
+    def __repr__(self):
+        return f'SymPyBooleanExpression({repr(self._expr)})'
+
+    def __str__(self):
+        return str(self._expr)
+
+    def __call__(self, *args, **kwargs):
+        return self._expr.subs(*args, **kwargs)
+
+
+    @classmethod
+    def from_string(cls, string, simplify=False):
+        """Convert a string representation of a boolean expression to a SymPy expression.
 
         Parameters
         ----------
-        graph : GraphS
-            Graph to validate.
+        string : str
+            Boolean expression using symbolic operators or aliases.
 
         Returns
         -------
-        bool
-            ``True`` if the graph has exactly one output.
+        sympy.logic.boolalg.Boolean or sympy.core.symbol.Symbol
+            SymPy expression equivalent of the parsed string.
+
+        Raises
+        ------
+        TypeError
+            If ``string`` is not of type ``str``.
+        ValueError
+            If invalid characters are present or parsing fails.
+
+        Example
+        -------
+        >>> from pyzx.boolean_logic import SymPyBooleanExpression
+        >>> expr = SymPyBooleanExpression.from_string('x_1 * -(x_2 + x_3 + x_4) ^ x_3')
+        >>> print(expr)
         """
 
-        return graph.num_outputs() == 1
+        if not isinstance(string, str):
+            raise TypeError(f'Input must be a string, got {type(string)}')
+
+        # Unify alternative operator representations
+        alt_operators = {
+            r'(?<![\w])0(?![\w])': 'false',
+            r'(?<![\w])1(?![\w])': 'true',
+            r'(?<![\w])not(?![\w])': '~',
+            '-': '~',
+            r'(?<![\w])and(?![\w])': '&',
+            r'\*': '&',
+            r'(?<![\w])or(?![\w])': '|',
+            r'\+': '|',
+            r'(?<![\w])xor(?![\w])': '^',
+        }
+        for op in alt_operators:
+            string = re.sub(op, alt_operators[op], string)
+
+        # Filter input string for valid characters because sympy_parse_expr uses eval()
+        character_whitelist = r'\w\s~&\|\^\(\)\[\]\{\}=<>,'
+        if match := re.findall(f'[^{character_whitelist}]', string):
+            raise ValueError('String contains invalid characters: ' + ', '.join(set(match)))
+
+        try:
+            expr = parse_expr(string, transformations=(auto_symbol,), evaluate=not simplify)
+        except (ValueError, TypeError, SyntaxError) as e:
+            raise ValueError(f'Error parsing expression. Parser got input: "{string}"\n{e}')
+        return cls(expr)
+
+
+    def to_matrix(self):
+        """Convert the expression to a matrix.
+
+        Returns
+        -------
+        numpy.ndarray
+            Array of shape ``(2**n, 2)`` where ``n`` is the number of variables
+            in the expression.
+        """
+
+        return np.array([
+            [0, 1] if self(zip(self.vars, assignment)) else [1, 0]
+            for assignment in itertools.product([False, True], repeat=len(self.vars))
+        ], dtype=np.complex128).T
+
+
+    def gate_counts(self):
+        """Count occurrences of boolean operators in the expression.
+
+        Returns
+        -------
+        dict[str, int]
+            Mapping from SymPy node type name (e.g., ``'And'``, ``'Or'``,
+            ``'Not'``, ``'Xor'``) to the number of occurrences in the
+            expression tree.
+        """
+
+        def count_gates(expr, dictionary):
+            if expr.args:
+                dictionary[expr.func.__name__] = dictionary.get(expr.func.__name__, 0) + 1
+                for arg in expr.args:
+                    count_gates(arg, dictionary)
+
+        counts = dict()
+        count_gates(self._expr, counts)
+        return counts
+
+
+    def depth(self):
+        """Compute the expression tree depth.
+
+        Returns
+        -------
+        int
+            Maximum nesting depth of boolean operators. Leaf expressions
+            (symbols/constants) have depth 0.
+        """
+
+        def count_depth(expr, current_depth=0):
+            if not expr.args:
+                return current_depth
+            return max(count_depth(arg, current_depth + 1) for arg in expr.args)
+
+        return count_depth(self._expr)
+
