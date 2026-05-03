@@ -1,6 +1,7 @@
 import re, itertools
 
 import numpy as np
+from fuzzingbook.Grammars import Grammar
 
 from sympy.core.symbol import Symbol
 from sympy.logic.boolalg import Boolean, BooleanFalse, BooleanTrue, Not, And, Or, Xor
@@ -15,6 +16,44 @@ class SymPyBooleanExpression:
     expr : sympy.logic.boolalg.Boolean or sympy.core.symbol.Symbol
         Expression to wrap.
     """
+
+
+    EBNF_GRAMMAR_TEMPLATE_PREFIX: Grammar = {
+        '<start>': ['<expr>'],
+        '<expr>': ['<func>', '<var>'],
+        '<func>': ['<unary_func>', '<nary_func>'],
+        '<unary_func>': ['Not(<expr>)'],
+        '<nary_func>': ['<nary_op>(<expr>(, <expr>)+)'],
+        '<nary_op>': ['And', 'Or', 'Xor'],
+    }
+    """EBNF grammar generting the supported boolean expression syntax with
+    operators in prefix notation.
+
+    Notes
+    -----
+    ``fuzzingbook.Grammars.is_valid_grammar`` returns False as the grammar
+    must be extended with a production for the ``<var>`` nonterminal producing
+    the desired number of variables."""
+
+    EBNF_GRAMMAR_TEMPLATE_INFIX: Grammar = {
+        '<start>': ['<expr>'],
+        '<expr>': ['<func>', '<var>'],
+        '<func>': ['<unary_func>', '<nary_func>'],
+        '<unary_func>': ['~(<expr>)'],
+        '<nary_func>': ['<and>', '<or>', '<xor>'],
+        '<and>': ['(<expr>( & <expr>)+)'],
+        '<or>': ['(<expr>( | <expr>)+)'],
+        '<xor>': ['(<expr>( ^ <expr>)+)'],
+    }
+    """EBNF grammar generting the supported boolean expression syntax with
+    operators in infix notation.
+
+    Notes
+    -----
+    ``fuzzingbook.Grammars.is_valid_grammar`` returns False as the grammar
+    must be extended with a production for the ``<var>`` nonterminal producing
+    the desired number of variables."""
+
 
     def __init__(self, expr):
         """Initialize the expression wrapper.

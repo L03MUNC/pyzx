@@ -1,12 +1,15 @@
-import sys, json
+import sys, random, json
 from enum import Enum
 from time import perf_counter
 from pathlib import Path
 
 import numpy as np
+from fuzzingbook.Grammars import extend_grammar, convert_ebnf_grammar
+from fuzzingbook.GrammarCoverageFuzzer import GrammarCoverageFuzzer, duplicate_context
 
 from ..gate_graph import LogicGateGraph
 from ..expression import SymPyBooleanExpression
+from . import helper as h
 
 
 class Evaluation:
@@ -30,24 +33,42 @@ class Evaluation:
         return self._metadata
 
 
-    def add_test_cases(self, test_cases, unique=False):
+    def add_test_cases(self, test_cases, unique=False, variable_names=None):
         """Add one or more test cases to the population.
 
         Parameters
         ----------
-        test_cases : str or TestCase or sequence of (str or TestCase)
+        test_cases : str or TestCase or list[str | TestCase]
             Test case(s) to add. Strings are converted to :class:`TestCase`.
         unique : bool, optional
-            If True, skip cases whose ``expr_string`` is already present.
+            If True, only add cases whose expression is *structurally unique*
+            up to variable renaming. Uniqueness is determined by replacing each
+            variable name in ``variable_names`` with the placeholder ``'x'`` in
+            the canonicalized expression string.
+        variable_names : list[str] or None, optional
+            Variable names used for the uniqueness check when ``unique`` is
+            True. Must be provided if ``unique`` is True.
 
         Raises
         ------
+        ValueError
+            If ``unique`` is True and ``variable_names`` is None.
         TypeError
             If an element of ``test_cases`` is neither ``str`` nor
             :class:`TestCase`.
         """
 
-        existing = {tc.expr_string for tc in self.population}
+        if unique and variable_names is None:
+            raise ValueError('variable_names must be provided when unique is True')
+
+        def unique_expr_string(tc, variable_names):
+            result = tc.expr_string
+            for var in variable_names:
+                result = result.replace(var, 'x')
+            return result
+
+        if unique:
+            existing = {unique_expr_string(tc, variable_names) for tc in self.population}
         if isinstance(test_cases, (str, TestCase)):
             test_cases = [test_cases]
         for tc in test_cases:
@@ -55,25 +76,104 @@ class Evaluation:
                 tc = TestCase(tc)
             elif not isinstance(tc, TestCase):
                 raise TypeError(f'Expected str or TestCase or list of these, got {type(tc)}')
-            if not unique or tc.expr_string not in existing:
-                self.population.append(tc)
-                existing.add(tc.expr_string)
+            if unique: 
+                if (string := unique_expr_string(tc, variable_names)) in existing:
+                    continue
+                else:
+                    existing.add(string)
+            self.population.append(tc)
 
 
-    def gen_population(self, num_cases, num_vars, seed=None):
-        """TODO: Docstrings
+    def add_metadata(self, **kwargs):
+        """Add key-value pairs to the evaluation metadata.
+
+        Parameters
+        ----------
+        **kwargs
+            Arbitrary key-value pairs to add to ``metadata``.
         """
 
+        self._metadata.update(kwargs)
+
+
+    def gen_population(self, num_cases, num_vars, grammar, seed=None, verbosity=0):
+        """Generate a population of random boolean-expression test cases.
+
+        Parameters
+        ----------
+        num_cases : int
+            Target number of test cases to generate.
+        num_vars : int
+            Number of distinct variables to use.
+        grammar : dict
+            EBNF grammar template describing the expression language. It must
+            contain a ``<var>`` nonterminal which will be replaced by the
+            generated variable names.
+        seed : int or None, optional
+            If given, seed Python's ``random`` module for reproducibility.
+        verbosity : int, optional
+            Verbosity level forwarded to the logger.
+
+        Raises
+        ------
+        ValueError
+            If the derived grammar cannot be used to construct the fuzzer.
+
+        Notes
+        -----
+        The generated test cases are added to :attr:`population` with
+        ``unique=True`` (up to variable renaming). This method also updates
+        :attr:`metadata` with ``num_cases``, ``num_vars`` and ``seed``.
+        """
+
+        def gen_fuzzer(grammar):
+            try:
+                return GrammarCoverageFuzzer(grammar)
+            except AssertionError as e:
+                raise ValueError('Error generating GrammarCoverageFuzzer. Probably, the grammar '
+                    f'is invalid:\n{grammar}') from e
+
+        h.printv(f'Generating population with {num_cases} cases and {num_vars} variables',
+            verbosity=verbosity, level=1)
+        if num_cases > 2 ** num_vars:
+            h.printv(f'Warning: {num_cases=} exceeds the number of possible boolean functions for '
+                f'{num_vars=}', verbosity=verbosity, level=0)
+
+        if seed:
+            random.seed(seed)
         self._metadata.update({'num_cases': num_cases, 'num_vars': num_vars, 'seed': seed})
-        rng = np.random.default_rng(seed)
-        # TODO: Generate input expressions from grammar
+        h.printv('\tGenerating grammar in BNF form', verbosity=verbosity, level=2)
+        variable_names = [f'x_{i}' for i in range(num_vars)]
+        ebnf_grammar = extend_grammar(grammar, {'<var>': variable_names})
+        bnf_grammar = convert_ebnf_grammar(ebnf_grammar)
+
+        fuzzer = gen_fuzzer(bnf_grammar)
+        num_fuzzes = 0
+        while len(self.population) < num_cases:
+            if not fuzzer.missing_expansion_coverage():
+                symbol = '<func>'
+                h.printv(f'\tAll expansions covered, duplicating context of {symbol}',
+                    verbosity=verbosity, level=2)
+                duplicate_context(bnf_grammar, symbol)
+            self.add_test_cases(fuzzer.fuzz(), True, variable_names)
+            num_fuzzes += 1
+        h.printv(f'Generated {num_cases} test cases in {num_fuzzes} fuzzes, '
+            f'{(100*num_cases/num_fuzzes):.0f}% efficiency', verbosity=verbosity, level=1)
 
 
-    def print_population(self):
-        """Print the expression strings of all test cases."""
+    def print_population(self, **kwargs):
+        """Pretty-print the current population.
 
-        printable = [tc.expr_string for tc in self.population]
-        print(printable)
+        Parameters
+        ----------
+        **kwargs
+            Keyword arguments forwarded to :func:`print`. If ``file`` is not
+            provided, it defaults to ``sys.stderr``.
+        """
+
+        kwargs['file'] = kwargs.get('file') or sys.stderr
+        print('[', *[f'\'{tc.expr_string}\'' for tc in self.population], ']',
+            sep='\n', **kwargs)
 
 
     def run(self, verbosity=0, callback=None):
@@ -96,6 +196,8 @@ class Evaluation:
         Stores total runtime in ``metadata['runtime_ms']``.
         """
 
+        h.printv(f'Running evaluation with {len(self.population)} test cases',
+            verbosity=verbosity, level=1)
         t0 = perf_counter()
         try:
             for i, tc in enumerate(self.population):
@@ -104,6 +206,8 @@ class Evaluation:
                     callback(i, tc)
         finally:
             self._metadata['runtime_ms'] = int((perf_counter() - t0) * 1000)
+        h.printv(f'Evaluation completed in {self._metadata["runtime_ms"]} ms\n',
+            verbosity=verbosity, level=1)
 
 
     def __call__(self, *args, **kwargs):
@@ -159,8 +263,6 @@ class Evaluation:
                 ``counts_by_result`` is a list of dictionaries, one per
                 :class:`TestResult` value, mapping ``metric_value -> count``.
         """
-
-        from . import helper as h
 
         # Minimum and maximum TestResult values for indexing result counts
         list_index_min, list_index_max = -2, 3
@@ -403,6 +505,7 @@ class TestCase:
         verbosity : int, optional
             Verbosity level controlling logging to stderr.
 
+            - -1: print nothing at all.
             - 0: only errors (exceptions) are printed.
             - 1: additionally print start/end summary per test case.
             - 2: additionally print per-step actions and assertions.
@@ -419,10 +522,6 @@ class TestCase:
             This method does not return UNDEFINED.
         """
 
-        def printv(*args, level=1, **kwargs):
-            if verbosity >= level:
-                print(*args, file=sys.stderr, **kwargs)
-
         # Contain the steps of the evaluation pipeline as (act, assert) pairs
         pipeline = [
             (self.create_zh, self.assert_zh),
@@ -431,27 +530,27 @@ class TestCase:
             # Circuit extraction is not supported yet
         ]
 
-        printv(f'Running test case: {self._expr_string}', level=1)
+        h.printv(f'Running test case: {self._expr_string}', verbosity=verbosity, level=1)
         self._result = TestResult.PASS
         for i, (act, assert_) in enumerate(pipeline):
             try:
-                printv(f'\tRunning step {i+1}: {act.__name__}', level=2)
+                h.printv(f'\tRunning step {i+1}: {act.__name__}', verbosity=verbosity, level=2)
                 act()
             except Exception as e:
-                printv(f'Error during {act.__name__}:\n{e}', level=0)
+                h.printv(f'Error during {act.__name__}:\n{e}', verbosity=verbosity, level=0)
                 self._result = TestResult.INVALID
                 break
     
             try:
-                printv('\tAsserting result', level=2)
+                h.printv('\tAsserting result', verbosity=verbosity, level=2)
                 assert_()
             except AssertionError:
-                printv(f'\tAssertion failed after step {i+1}', level=2)
+                h.printv(f'\tAssertion failed after step {i+1}', verbosity=verbosity, level=2)
                 # Determine TestResult enum value based on which step failed
                 self._result = TestResult(i + 1)
                 break
 
-        printv(f'Test result: {self._result.name}', level=1)
+        h.printv(f'Test result: {self._result.name}', verbosity=verbosity, level=1)
         return self._result
 
     def __call__(self, *args, **kwargs):
@@ -506,15 +605,16 @@ class TestCase:
                 Maximum operator nesting depth.
         """
 
+        gate_counts = self._expr_sympy.gate_counts()
         return {
             'expr_string': self._expr_string,
             'result': self._result.value,
             'num_vars': len(self._expr_sympy.vars),
-            'num_gates': sum(self._expr_sympy.gate_counts().values()),
-            'num_not_gates': self._expr_sympy.gate_counts().get('Not', 0),
-            'num_and_gates': self._expr_sympy.gate_counts().get('And', 0),
-            'num_or_gates': self._expr_sympy.gate_counts().get('Or', 0),
-            'num_xor_gates': self._expr_sympy.gate_counts().get('Xor', 0),
+            'num_gates': sum(gate_counts.values()),
+            'num_not_gates': gate_counts.get('Not', 0),
+            'num_and_gates': gate_counts.get('And', 0),
+            'num_or_gates': gate_counts.get('Or', 0),
+            'num_xor_gates': gate_counts.get('Xor', 0),
             'expr_depth': self._expr_sympy.depth(),
         }
 

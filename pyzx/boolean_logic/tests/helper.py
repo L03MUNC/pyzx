@@ -1,3 +1,27 @@
+import sys
+
+
+def printv(*args, verbosity, level, **kwargs):
+    """
+    Print to stderr if verbosity is high enough.
+
+    Parameters
+    ----------
+    *args
+        Arguments to print.
+    verbosity : int
+        Current verbosity level.
+    level : int
+        Minimum verbosity level for printing.
+    **kwargs
+        Additional keyword arguments for the print function.
+    """
+
+    if verbosity >= level:
+        kwargs['file'] = kwargs.get('file') or sys.stderr
+        print(*args, **kwargs)
+
+
 def dol_from_lod(lod, key_key, list_key, list_index_range=None):
     """Group a list of dicts into counts stored as a dict of lists.
 
