@@ -21,7 +21,7 @@ and Poly is a sum of terms.
 Lark is used to define a parser that can translate a string into a Poly.
 """
 
-from typing import Any, Callable, Union, Optional, Dict, List, Tuple, Set
+from typing import Any, Callable, Mapping, Union, Optional, Dict, List, Tuple, Set
 from lark import Lark, Transformer
 from functools import reduce
 from operator import add, mul
@@ -128,14 +128,14 @@ class Term:
 
         Example: (x^2 * y) * (y^3 * z) = x^2 * y^4 * z
         Boolean variables are treated idempotently (x^2 = x), ensuring their
-        exponent isreduced to 1 when multiplying.
+        exponent is reduced to 1 when multiplying.
         """
         vs = dict()
         for v, c in self.vars + other.vars:
             if v not in vs: vs[v] = c
             else: vs[v] += c
             # TODO deal with fractional / symbolic powers
-            if v.is_bool and c > 1:
+            if v.is_bool and vs[v] > 1:
                 vs[v] = 1
         return Term([(v, c) for v, c in vs.items()])
 
@@ -159,17 +159,18 @@ class Term:
         """Check if this term is a Boolean term (i.e. all variables are Boolean)"""
         return all(v.is_bool for v, _ in self.vars)
 
-    def substitute(self, var_map: Dict[Var, Union[float, complex, 'Fraction']]) -> Tuple[Union[float, complex, 'Fraction'], 'Term']:
+    def substitute(self, var_map: Mapping[Var, Union[float, complex, 'Fraction', 'Poly']]) -> Tuple[Union[int, float, complex, 'Fraction', 'Poly'], 'Term']:
         """Evaluate variables present in ``var_map`` and return residual term.
 
-        The method extracts the numerical coefficient contributed by
-        substituted variables and returns both the coefficient and a new term
-        containing only the untouched variables. This is a building block for
-        partial evaluation of polynomials.
+        The method extracts the factor contributed by substituted variables
+        and returns both the factor and a new term containing only the
+        untouched variables. The factor may be a ``Poly`` when symbolic
+        values are substituted. This is a building block for partial
+        evaluation of polynomials.
 
         Example: substituting {x: 2} in x^2*y^3 gives (4, Term([(y, 3)]))
         """
-        coeff: Union[float, complex, 'Fraction'] = 1.
+        coeff: Union[int, float, complex, 'Fraction', 'Poly'] = 1
         new_vars = []
         for v, c in self.vars:
             if v in var_map:
@@ -388,12 +389,18 @@ class Poly:
         for _, term in self.terms:
             term.rebind_variables_to_registry(new_registry)
 
-    def substitute(self, var_map: Dict[Var, Union[float, complex, 'Fraction']]) -> 'Poly':
-        """Partially evaluate the polynomial with the provided variable values."""
+    def substitute(self, var_map: Mapping[Var, Union[float, complex, 'Fraction', 'Poly']]) -> 'Poly':
+        """Partially evaluate the polynomial with the provided variable values.
+
+        Values may be scalars (float, complex, Fraction) or Poly instances
+        for symbolic-to-symbolic substitution."""
         p = Poly([])
         for c, t in self.terms:
             coeff, term = t.substitute(var_map)
-            p += Poly([(c * coeff, term)])
+            if isinstance(coeff, Poly):
+                p += coeff * Poly([(c, term)])
+            else:
+                p += Poly([(c * coeff, term)])
         return p
 
 def new_var(name: str, is_bool: bool, registry: Optional[VarRegistry] = None) -> Poly:

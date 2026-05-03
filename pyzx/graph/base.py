@@ -24,9 +24,10 @@ from typing_extensions import Literal, GenericMeta # type: ignore # https://gith
 
 import numpy as np
 
-from ..symbolic import Poly, VarRegistry
+from ..symbolic import Poly, VarRegistry, Var
 from ..utils import EdgeType, VertexType, toggle_edge, vertex_is_zx, get_z_box_label, set_z_box_label, get_h_box_label, set_h_box_label, hbox_has_complex_label
-from ..utils import FloatInt, FractionLike
+from ..utils import FloatInt, FractionLike, assert_phase_real
+from .scalar import simplify_poly
 from ..tensor import tensorfy, tensor_to_matrix
 
 from .scalar import Scalar
@@ -619,7 +620,7 @@ class BaseGraph(Generic[VT, ET], metaclass=DocstringMeta):
         phases = other.phases()
         vertex_map = dict()
         for v in other.vertices():
-            w = g.add_vertex(ts[v],qs[v]+height,rs[v],phases[v],g.is_ground(v))
+            w = g.add_vertex(ts[v],qs[v]+height,rs[v],phases[v],other.is_ground(v))
             g.set_vdata_dict(w, other.vdata_dict(v))
             vertex_map[v] = w
         for e in other.edges():
@@ -732,15 +733,29 @@ class BaseGraph(Generic[VT, ET], metaclass=DocstringMeta):
 
         vert_map = dict()
         for v in verts:
-            w = g.add_vertex(ty[v], qs[v], rs[v], phase[v], v in grounds, index=v)
+            p = copy.deepcopy(phase[v]) if isinstance(phase[v], Poly) else phase[v]
+            w = g.add_vertex(ty[v], qs[v], rs[v], p, v in grounds, index=v)
             vert_map[v] = w
-            g.set_vdata_dict(w, self.vdata_dict(v))
+            vd = self.vdata_dict(v)
+            for k, val in vd.items():
+                if isinstance(val, Poly):
+                    vd[k] = copy.deepcopy(val)
+            g.set_vdata_dict(w, vd)
         for e in edges:
             s,t = self.edge_st(e)
             new_e = g.add_edge((vert_map[s], vert_map[t]), self.edge_type(e))
             g.set_edata_dict(new_e, self.edata_dict(e))
 
-        for name in self.var_registry.vars():
+        used_var_names: Set[str] = set()
+        for v in verts:
+            p = phase[v]
+            if isinstance(p, Poly):
+                used_var_names.update(var.name for var in p.free_vars())
+            if ty[v] == VertexType.Z_BOX:
+                label = get_z_box_label(self, v)
+                if isinstance(label, Poly):
+                    used_var_names.update(var.name for var in label.free_vars())
+        for name in used_var_names:
             g.var_registry.set_type(name, self.var_registry.get_type(name))
         g.rebind_variables_to_registry()
 
@@ -1161,13 +1176,104 @@ class BaseGraph(Generic[VT, ET], metaclass=DocstringMeta):
         return True
 
     def rebind_variables_to_registry(self) -> None:
-        """Rebind all variables in phases to this graph's registry.
-        This should be called after deep copying a graph to ensure all variables
-        reference the new graph's registry."""
+        """Rebind all variables in phases, Z-box labels, and the scalar to this
+        graph's registry. This should be called after deep copying a graph to
+        ensure all variables reference the new graph's registry."""
         for v in self.vertices():
             phase = self.phase(v)
             if isinstance(phase, Poly):
                 phase.rebind_variables_to_registry(self.var_registry)
+            if self.type(v) == VertexType.Z_BOX:
+                label = get_z_box_label(self, v)
+                if isinstance(label, Poly):
+                    label.rebind_variables_to_registry(self.var_registry)
+        for attr in [self.scalar.phase] + self.scalar.phasenodes + list(self.scalar.sum_of_phases.keys()):
+            if isinstance(attr, Poly):
+                attr.rebind_variables_to_registry(self.var_registry)
+
+    def substitute_variables(self, var_values: Mapping[str, Union[float, complex, Fraction, Poly]],
+                   in_place: bool = False) -> 'BaseGraph[VT, ET]':
+        """Substitute values for symbolic variables in all phases and Z-box labels.
+
+        Note: H-box labels are always concrete complex numbers, so they are not
+        eligible for substitution.
+
+        Args:
+            var_values: Mapping from variable names (strings) to their
+                        substitution values (float, complex, Fraction, or Poly).
+                        Complex values are only valid for Z-box labels; phases
+                        must be real-valued.
+            in_place: If True, modify this graph. If False (default), return
+                      a new graph with substitutions applied.
+
+        Returns:
+            The graph with variables substituted (self if in_place=True,
+            a copy otherwise).
+
+        Example:
+            >>> g.substitute_variables({'theta': 0.5, 'phi': Fraction(1, 4)})
+        """
+        if in_place:
+            result = self
+        else:
+            result = copy.deepcopy(self)
+
+        # Collect all Var objects from the graph and map to user-provided values.
+        all_vars: Set[Var] = set()
+        for v in result.vertices():
+            phase = result.phase(v)
+            if isinstance(phase, Poly):
+                all_vars.update(phase.free_vars())
+            if result.type(v) == VertexType.Z_BOX:
+                label = get_z_box_label(result, v)
+                if isinstance(label, Poly):
+                    all_vars.update(label.free_vars())
+        all_vars.update(result.scalar.free_vars())
+
+        var_map: Dict[Var, Union[float, complex, Fraction, Poly]] = {
+            var: var_values[var.name] for var in all_vars if var.name in var_values
+        }
+        if not var_map:
+            return result
+
+        # Precompute all substitutions before mutating, so the graph is not
+        # left partially substituted if an error occurs.
+        new_phases: Dict[VT, Union[int, float, complex, Fraction, Poly]] = {}
+        new_labels: Dict[VT, Union[int, float, complex, Fraction, Poly]] = {}
+        for v in result.vertices():
+            phase = result.phase(v)
+            if isinstance(phase, Poly):
+                new_phases[v] = simplify_poly(phase.substitute(var_map))
+            if result.type(v) == VertexType.Z_BOX:
+                label = get_z_box_label(result, v)
+                if isinstance(label, Poly):
+                    new_labels[v] = simplify_poly(label.substitute(var_map))
+        new_scalar = result.scalar.substitute_variables(var_map)
+
+        # Validate phases before mutating: reject complex values for non-Z-box
+        # vertices. This catches both plain complex scalars and Poly instances
+        # with complex coefficients.
+        for v, new_phase in new_phases.items():
+            try:
+                assert_phase_real(new_phase)  # type: ignore[arg-type]
+            except TypeError:
+                raise TypeError(
+                    f"Substitution produced complex phase {new_phase} for "
+                    f"vertex {v}; only Z-box labels may be complex.")
+
+        # Apply all substitutions.
+        for v, new_phase in new_phases.items():
+            result.set_phase(v, new_phase)  # type: ignore[arg-type]
+        for v, new_label in new_labels.items():
+            set_z_box_label(result, v, new_label)
+        result.scalar = new_scalar
+
+        # Poly substitution values may carry variables bound to a different
+        # registry. Rebind so all variables use the graph's own registry.
+        if any(isinstance(val, Poly) for val in var_map.values()):
+            result.rebind_variables_to_registry()
+
+        return result
 
     def __deepcopy__(self, memo):
         """Custom deepcopy implementation to ensure variable registry is properly handled
