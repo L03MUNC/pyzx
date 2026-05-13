@@ -4,12 +4,20 @@ from time import perf_counter
 from pathlib import Path
 
 import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from fuzzingbook.Grammars import extend_grammar, convert_ebnf_grammar
 from fuzzingbook.GrammarCoverageFuzzer import GrammarCoverageFuzzer, duplicate_context
+from fuzzingbook.Timeout import Timeout
 
 from ..gate_graph import LogicGateGraph
 from ..expression import SymPyBooleanExpression
 from . import helper as h
+from ...graph.base import BaseGraph
+from ...drawing import draw_matplotlib, matrix_to_latex as zx_matrix_to_latex
+
+
+DEFAULT_STEP_TIMEOUT_LIMIT_MS = 5000
 
 
 class Evaluation:
@@ -135,9 +143,6 @@ class Evaluation:
 
         h.printv(f'Generating population with {num_cases} cases and {num_vars} variables',
             verbosity=verbosity, level=1)
-        if num_cases > 2 ** num_vars:
-            h.printv(f'Warning: {num_cases=} exceeds the number of possible boolean functions for '
-                f'{num_vars=}', verbosity=verbosity, level=0)
 
         if seed:
             random.seed(seed)
@@ -176,7 +181,10 @@ class Evaluation:
             sep='\n', **kwargs)
 
 
-    def run(self, verbosity=0, callback=None):
+    def run(
+            self, verbosity=0, callback=None,
+            step_timeout_limit_ms=DEFAULT_STEP_TIMEOUT_LIMIT_MS
+        ):
         """Run all test cases in the population.
 
         Parameters
@@ -190,23 +198,27 @@ class Evaluation:
             - ``index`` (int) is the 0-based index in ``population``.
             - ``test_case`` (TestCase) is the executed instance. Its
                 :attr:`~TestCase.result` has been set.
+        step_timeout_limit_ms : int, optional
+            Timeout limit in milliseconds for each pipeline step of each test case.
+            Defaults to :data:`DEFAULT_STEP_TIMEOUT_LIMIT_MS`.
 
         Notes
         -----
         Stores total runtime in ``metadata['runtime_ms']``.
         """
 
-        h.printv(f'Running evaluation with {len(self.population)} test cases',
+        h.printv(f'Running evaluation with {len(self.population)} test cases\n',
             verbosity=verbosity, level=1)
         t0 = perf_counter()
         try:
             for i, tc in enumerate(self.population):
-                tc(verbosity)
+                h.printv(f'({i+1}/{len(self.population)}) ', end='', verbosity=verbosity, level=1)
+                tc(verbosity, step_timeout_limit_ms)
                 if callback:
                     callback(i, tc)
         finally:
             self._metadata['runtime_ms'] = int((perf_counter() - t0) * 1000)
-        h.printv(f'Evaluation completed in {self._metadata["runtime_ms"]} ms\n',
+        h.printv(f'Evaluation completed, total runtime: {self._metadata["runtime_ms"]} ms\n',
             verbosity=verbosity, level=1)
 
 
@@ -231,6 +243,12 @@ class Evaluation:
                     'metadata': dict,
                     'result_enum': list[str],
                     'test_cases': list[dict],
+                    'timing': {
+                        'runtimes': list[list[int]],
+                        'avg_runtimes': list[int],
+                        'timeout': list[bool],
+                        'timeout_fractions': list[float],
+                    },
                     'result_counts': list[int],
                     'to_result_counts': dict[str, dict[int, list[int]]],
                     'from_result_counts': dict[str, list[dict[int, int]]],
@@ -250,6 +268,24 @@ class Evaluation:
                 :meth:`TestCase.to_dict`, i.e.::
 
                     {'expr_string': <str>, 'result': <TestResult name>}
+
+            ``timing``
+                Aggregated timing information across all test cases.
+
+                ``timing['runtimes']``
+                    List of per-test-case runtime lists (in milliseconds),
+                    one entry per executed pipeline step.
+
+                ``timing['avg_runtimes']``
+                    Average runtime in milliseconds for each pipeline step.
+
+                ``timing['timeout']``
+                    Boolean list indicating whether the corresponding test case
+                    hit the timeout limit in any step.
+
+                ``timing['timeout_fractions']``
+                    Fractions of timeouts per :class:`TestResult` bucket.
+                    Entries align with ``result_enum``.
 
             ``result_counts``
                 Counts per :class:`TestResult` value.
@@ -275,11 +311,36 @@ class Evaluation:
         result_counts = [0] * (list_index_max - list_index_min + 1)
         for tc in lod:
             result_counts[tc['result'] - list_index_min] += 1
+        runtimes = [
+            [tc.timing['runtimes'][step] for step in sorted(tc.timing['runtimes'])]
+            for tc in self.population
+        ]
+        avg_runtimes = [
+            int(runtime) for runtime in np.nanmean([
+                runtime + [np.nan] * (max(len(runtime) for runtime in runtimes) - len(runtime))
+                for runtime in runtimes
+            ], axis=0)
+        ]
+        timeout = [tc.timing['timeout'] for tc in self.population]
+        timeout_fractions = [0] * (list_index_max - list_index_min + 1)
+        for tc in lod:
+            if tc['timeout']:
+                timeout_fractions[tc['result'] - list_index_min] += 1
+        timeout_fractions = [
+            round(count / result_counts[i], 2) if result_counts[i] > 0 else 0.0
+            for i, count in enumerate(timeout_fractions)
+        ]
 
         summary = {
             'metadata': self._metadata,
             'result_enum': [val.name for val in TestResult],
             'test_cases': [tc.to_dict() for tc in self.population],
+            'timing': {
+                'runtimes': runtimes,
+                'avg_runtimes': avg_runtimes,
+                'timeout': timeout,
+                'timeout_fractions': timeout_fractions,
+            },
             'result_counts': result_counts,
             # Structure of 'to_result_counts': {
             #   '<metric_0>': {
@@ -336,7 +397,7 @@ class TestCase:
         self._expr_matrix = self._expr_sympy.to_matrix()
         self._zh = self._zh_matrix = self._simplified = self._simplified_matrix = self._circuit \
             = self._circuit_matrix = None
-        self._result = TestResult.UNDEFINED
+        self._result, self._timing = TestResult.UNDEFINED, {'runtimes': dict(), 'timeout': False}
 
 
     @property
@@ -403,6 +464,26 @@ class TestCase:
         """
 
         return self._result
+
+    @property
+    def timing(self):
+        """dict: Timing metadata collected during :meth:`run`.
+
+        Notes
+        -----
+        The dictionary has the following keys:
+
+        ``'runtimes'``
+            Mapping ``step_index -> runtime_ms`` for each executed pipeline
+            step. Step indices are 1-based and correspond to the order in the
+            evaluation pipeline.
+
+        ``'timeout'``
+            Boolean flag indicating whether any pipeline step hit the timeout
+            limit.
+        """
+
+        return self._timing
 
 
     def __repr__(self):
@@ -497,7 +578,7 @@ class TestCase:
         assert self.compare_matrices(self._expr_matrix, self._circuit_matrix)
 
 
-    def run(self, verbosity=0):
+    def run(self, verbosity=0, step_timeout_limit_ms=DEFAULT_STEP_TIMEOUT_LIMIT_MS):
         """Execute the evaluation pipeline.
 
         Parameters
@@ -517,7 +598,8 @@ class TestCase:
 
             - PASS: all pipeline steps run and all assertions pass.
             - INVALID: an exception occurs during a pipeline action.
-            - FAIL1/FAIL2/FAIL3: assertion fails after step 1/2/3 respectively.
+            - FAIL1/FAIL2/FAIL3: assertion fails after step 1/2/3 respectively,
+            or the step times out.
 
             This method does not return UNDEFINED.
         """
@@ -533,14 +615,26 @@ class TestCase:
         h.printv(f'Running test case: {self._expr_string}', verbosity=verbosity, level=1)
         self._result = TestResult.PASS
         for i, (act, assert_) in enumerate(pipeline):
+            h.printv(f'\tRunning step {i+1}: {act.__name__}', verbosity=verbosity, level=2)
+            t0 = perf_counter()
             try:
-                h.printv(f'\tRunning step {i+1}: {act.__name__}', verbosity=verbosity, level=2)
-                act()
+                with Timeout(step_timeout_limit_ms / 1000):
+                    act()
+            except TimeoutError:
+                h.printv(f'\tTimeout after {step_timeout_limit_ms} milliseconds during {act.__name__}',
+                    verbosity=verbosity, level=2)
+                self._result = TestResult(i + 1)
+                self._timing['timeout'] = True
+                break
             except Exception as e:
-                h.printv(f'Error during {act.__name__}:\n{e}', verbosity=verbosity, level=0)
+                h.printv(f'[Test case {self._expr_string}] Error during {act.__name__}:\n{e}',
+                    verbosity=verbosity, level=0)
                 self._result = TestResult.INVALID
                 break
-    
+            finally:
+                self._timing['runtimes'][i+1] = \
+                    min(int((perf_counter() - t0) * 1000), step_timeout_limit_ms)
+
             try:
                 h.printv('\tAsserting result', verbosity=verbosity, level=2)
                 assert_()
@@ -550,7 +644,7 @@ class TestCase:
                 self._result = TestResult(i + 1)
                 break
 
-        h.printv(f'Test result: {self._result.name}', verbosity=verbosity, level=1)
+        h.printv(f'Test result: {self._result.name}\n', verbosity=verbosity, level=1)
         return self._result
 
     def __call__(self, *args, **kwargs):
@@ -577,6 +671,104 @@ class TestCase:
         return np.allclose(m1, msum, scalar, 0.25)
 
 
+    def draw(self, filepath=None):
+        """Render a visualization of the test case and computed representations.
+
+        The figure contains the matrix of the original boolean expression and,
+        if available, the ZH-diagram, the simplified diagram, and the extracted
+        circuit along with their associated matrices.
+
+        Parameters
+        ----------
+        filepath : str or pathlib.Path or None, optional
+            If given, save the rendered figure to this path using
+            :meth:`matplotlib.figure.Figure.savefig`.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+            The created Matplotlib figure.
+
+        Notes
+        -----
+        The diagram drawings are produced via :func:`pyzx.drawing.draw_matplotlib`.
+        Matrix rendering uses LaTeX (``usetex=True``) and requires a working
+        LaTeX installation in the runtime environment.
+        """
+
+        def obj_to_fig(obj):
+            if isinstance(obj, BaseGraph):
+                rows = [obj.row(v) for v in obj.vertex_set()]
+                qubits = [obj.qubit(v) for v in obj.vertex_set()]
+                width = max(rows) - min(rows) + 1
+                height = max(qubits) - min(qubits) + 1
+                return draw_matplotlib(
+                    obj, h_edge_draw='box', show_scalar=True, labels=True, figsize=(width, height)
+                )
+            else:
+                raise NotImplementedError(f'Drawing not implemented for type {type(obj)}')
+
+        def matrix_to_latex(matrix):
+            # use array environment because pmatrix does not allow more than 10 columns
+            num_cols = 2 ** len(self._expr_sympy.vars)
+            return zx_matrix_to_latex(matrix) \
+                .replace('{equation}', '{equation*}') \
+                .replace(r'\begin{pmatrix}',
+                    r'\left( \begin{array}{@{}*{' + str(num_cols) + '}{c}@{}}') \
+                .replace(r'\end{pmatrix}', r'\end{array} \right)') \
+                .replace('\n', ' ') \
+                if matrix is not None else 'N/A'
+
+        def setup_axes(ax, title):
+            ax.margins(0)
+            ax.set_axis_off()
+            ax.set_title(title, y=1.0, pad=-14)
+
+        plt.rcParams['text.latex.preamble'] = r'\usepackage{amsmath}'
+
+        objs_matrices_titles = [
+            (self._zh, self._zh_matrix, 'ZH-diagram:'),
+            (self._simplified, self._simplified_matrix, 'Simplified diagram:'),
+            (self._circuit, self._circuit_matrix, 'Extracted circuit:'),
+        ]
+
+        figs_latex = [
+            (obj_to_fig(obj), matrix_to_latex(matrix), title) 
+            for obj, matrix, title in objs_matrices_titles if obj
+        ]
+        figwidths = [fig.get_figwidth() for fig, _, _ in figs_latex]
+        figheights = [fig.get_figheight() for fig, _, _ in figs_latex]
+        fig = plt.figure(figsize=(
+            max(figwidths)*0.625, sum(figheights) / 2 + 1
+        ))
+        spec = fig.add_gridspec(
+            len(figs_latex) + 1, 2,
+            left=0, bottom=0, right=1, top=1, wspace=0, hspace=0,
+            width_ratios=[4, 1], height_ratios=[2] + figheights
+        )
+
+        ax0 = fig.add_subplot(spec[0, 0:2])
+        setup_axes(ax0, 'Test case ' + self._expr_string)
+        ax0.text(0, 0, matrix_to_latex(self.expr_matrix),
+            usetex=True, size='large', ha='center', va='center')
+
+        for i, (fig_i, latex_i, title) in enumerate(figs_latex):
+            ax_fig = fig.add_subplot(spec[i+1, 0])
+            setup_axes(ax_fig, title)
+            canvas = FigureCanvasAgg(fig_i)
+            canvas.draw()
+            ax_fig.imshow(np.asarray(canvas.buffer_rgba()))
+
+            ax_latex = fig.add_subplot(spec[i+1, 1])
+            setup_axes(ax_latex, 'Associated matrix:')
+            ax_latex.text(0, 0, latex_i, usetex=True, size='large', ha='center', va='center')
+
+        if filepath:
+            fig.savefig(filepath, bbox_inches='tight', pad_inches=0)
+
+        return fig
+
+
     def summary(self):
         """Return a numeric summary of this test case.
 
@@ -589,6 +781,8 @@ class TestCase:
                 Canonical expression string.
             ``result``
                 Integer :class:`TestResult` value (e.g. ``0`` for PASS).
+            ``timeout``
+                Timeout value for the test case.
             ``num_vars``
                 Number of variables in the expression.
             ``num_gates``
@@ -609,6 +803,7 @@ class TestCase:
         return {
             'expr_string': self._expr_string,
             'result': self._result.value,
+            'timeout': self._timing['timeout'],
             'num_vars': len(self._expr_sympy.vars),
             'num_gates': sum(gate_counts.values()),
             'num_not_gates': gate_counts.get('Not', 0),
