@@ -17,7 +17,21 @@ from ...graph.base import BaseGraph
 from ...drawing import draw_matplotlib, matrix_to_latex as zx_matrix_to_latex
 
 
-DEFAULT_STEP_TIMEOUT_LIMIT_MS = 5000
+DEFAULT_STEP_TIMEOUT_LIMIT_MS = 10000
+
+
+class TestResult(Enum):
+    INVALID = -2
+    UNDEFINED = -1
+    PASS = 0
+    # Positive integers indicate which step of the pipeline failed,
+    # e.g. FAIL1 means the first check failed
+    FAIL1 = 1
+    FAIL2 = 2
+    FAIL3 = 3
+
+TEST_RESULT_MIN = min(res.value for res in TestResult)
+TEST_RESULT_MAX = max(res.value for res in TestResult)
 
 
 class Evaluation:
@@ -136,7 +150,11 @@ class Evaluation:
 
         def gen_fuzzer(grammar):
             try:
-                return GrammarCoverageFuzzer(grammar)
+                return GrammarCoverageFuzzer(
+                    grammar,
+                    min_nonterminals=1,
+                    max_nonterminals=8,
+                )
             except AssertionError as e:
                 raise ValueError('Error generating GrammarCoverageFuzzer. Probably, the grammar '
                     f'is invalid:\n{grammar}') from e
@@ -153,15 +171,27 @@ class Evaluation:
         bnf_grammar = convert_ebnf_grammar(ebnf_grammar)
 
         fuzzer = gen_fuzzer(bnf_grammar)
-        num_fuzzes = 0
+        num_fuzzes = duplicate = 0
         while len(self.population) < num_cases:
             if not fuzzer.missing_expansion_coverage():
                 symbol = '<func>'
-                h.printv(f'\tAll expansions covered, duplicating context of {symbol}',
-                    verbosity=verbosity, level=2)
+                # Increase generation depth
+                duplicate += 1
                 duplicate_context(bnf_grammar, symbol)
+                fuzzer.min_nonterminals += 1
+                fuzzer.max_nonterminals += 1
+                h.printv(
+                    f'    All expansions covered. Duplicating context of {symbol} {duplicate} '
+                    + ('times' if duplicate != 1 else 'time')
+                    + ' and incrementing interval bounds of nonterminals to '
+                    f'({fuzzer.min_nonterminals}, {fuzzer.max_nonterminals})', end='',
+                    verbosity=verbosity, level=2
+                )
+            h.printv(f'\rFuzzer generating test case {len(self.population)+1} of {num_cases}...',
+                end='', verbosity=verbosity, level=1)
             self.add_test_cases(fuzzer.fuzz(), True, variable_names)
             num_fuzzes += 1
+        h.printv(verbosity=verbosity, level=1)
         h.printv(f'Generated {num_cases} test cases in {num_fuzzes} fuzzes, '
             f'{(100*num_cases/num_fuzzes):.0f}% efficiency', verbosity=verbosity, level=1)
 
@@ -244,14 +274,14 @@ class Evaluation:
                     'result_enum': list[str],
                     'test_cases': list[dict],
                     'timing': {
-                        'runtimes': list[list[int]],
                         'avg_runtimes': list[int],
-                        'timeout': list[bool],
                         'timeout_fractions': list[float],
+                        'result_to_runtime': list[list[int]],
                     },
                     'result_counts': list[int],
-                    'to_result_counts': dict[str, dict[int, list[int]]],
-                    'from_result_counts': dict[str, list[dict[int, int]]],
+                    'result_fractions': list[float],
+                    'metric_to_result': dict[str, dict[int, list[int]]],
+                    'result_to_metric': dict[str, list[dict[int, int]]],
                 }
 
             with the keys defined as follows.
@@ -265,52 +295,56 @@ class Evaluation:
 
             ``test_cases``
                 List of per-test-case dictionaries as returned by
-                :meth:`TestCase.to_dict`, i.e.::
-
-                    {'expr_string': <str>, 'result': <TestResult name>}
+                :meth:`TestCase.to_dict`.
 
             ``timing``
                 Aggregated timing information across all test cases.
 
-                ``timing['runtimes']``
-                    List of per-test-case runtime lists (in milliseconds),
-                    one entry per executed pipeline step.
-
                 ``timing['avg_runtimes']``
                     Average runtime in milliseconds for each pipeline step.
-
-                ``timing['timeout']``
-                    Boolean list indicating whether the corresponding test case
-                    hit the timeout limit in any step.
 
                 ``timing['timeout_fractions']``
                     Fractions of timeouts per :class:`TestResult` bucket.
                     Entries align with ``result_enum``.
 
+                ``timing['result_to_runtime']``
+                    List of lists of runtimes (in milliseconds) of the last executed
+                    step of each test case, grouped by :class:`TestResult` value.
+                    Outer list aligns with ``result_enum``.
+
             ``result_counts``
                 Counts per :class:`TestResult` value.
 
-            ``to_result_counts``
+            ``metric_to_result``
                 Nested mapping ``metric -> metric_value -> counts`` where
                 ``counts`` is a list with one entry per :class:`TestResult` value.
 
-            ``from_result_counts``
+            ``result_to_metric``
                 Mapping ``metric -> counts_by_result`` where
                 ``counts_by_result`` is a list of dictionaries, one per
                 :class:`TestResult` value, mapping ``metric_value -> count``.
+
+        Raises
+        ------
+        ValueError
+            If the population is empty and a summary cannot be built.
         """
 
+        if not self.population:
+            raise ValueError('Population is empty, cannot build summary')
+
         # Minimum and maximum TestResult values for indexing result counts
-        list_index_min, list_index_max = -2, 3
+        list_len = TEST_RESULT_MAX - TEST_RESULT_MIN + 1
         metrics = [
             'num_vars', 'num_gates', 'num_not_gates', 'num_and_gates', 'num_or_gates',
-            'num_xor_gates', 'expr_depth',
+            'num_xor_gates', 'expr_depth', 'num_literals',
         ]
         lod = [tc.summary() for tc in self.population]
 
-        result_counts = [0] * (list_index_max - list_index_min + 1)
+        result_counts = [0] * list_len
         for tc in lod:
-            result_counts[tc['result'] - list_index_min] += 1
+            result_counts[tc['result'] - TEST_RESULT_MIN] += 1
+        result_fractions = [round(result / len(self.population), 2) for result in result_counts]
         runtimes = [
             [tc.timing['runtimes'][step] for step in sorted(tc.timing['runtimes'])]
             for tc in self.population
@@ -321,44 +355,46 @@ class Evaluation:
                 for runtime in runtimes
             ], axis=0)
         ]
-        timeout = [tc.timing['timeout'] for tc in self.population]
-        timeout_fractions = [0] * (list_index_max - list_index_min + 1)
+        timeout_counts = [0] * list_len
         for tc in lod:
             if tc['timeout']:
-                timeout_fractions[tc['result'] - list_index_min] += 1
+                timeout_counts[tc['result'] - TEST_RESULT_MIN] += 1
         timeout_fractions = [
             round(count / result_counts[i], 2) if result_counts[i] > 0 else 0.0
-            for i, count in enumerate(timeout_fractions)
+            for i, count in enumerate(timeout_counts)
         ]
+        result_to_runtime = [list() for _ in range(list_len)]
+        for tc, runtime in zip(lod, runtimes):
+            result_to_runtime[tc['result'] - TEST_RESULT_MIN].append(runtime[-1])
 
         summary = {
             'metadata': self._metadata,
             'result_enum': [val.name for val in TestResult],
             'test_cases': [tc.to_dict() for tc in self.population],
             'timing': {
-                'runtimes': runtimes,
                 'avg_runtimes': avg_runtimes,
-                'timeout': timeout,
                 'timeout_fractions': timeout_fractions,
+                'result_to_runtime': result_to_runtime,
             },
             'result_counts': result_counts,
-            # Structure of 'to_result_counts': {
+            'result_fractions': result_fractions,
+            # Structure of 'metric_to_result': {
             #   '<metric_0>': {
             #       <key_0>: [<num_invalid>, <num_undefined>, ...],
             #       <key_1>: [<num_invalid>, <num_undefined>, ...],
             #   ...},
             # ...}
-            'to_result_counts': h.dodol_from_lod(
-                lod, metrics, 'result', (list_index_min, list_index_max)
+            'metric_to_result': h.dodol_from_lod(
+                lod, metrics, 'result', (TEST_RESULT_MIN, TEST_RESULT_MAX)
             ),
-            # Structure of 'from_result_counts': {
+            # Structure of 'result_to_metric': {
             #   '<metric_0>': [
             #       {<key_0>: <num_invalid>, <key_1>: <num_invalid>, ...},
             #       {<key_0>: <num_undefined>, <key_1>: <num_undefined>, ...},
             #   ...],
             # ...}
-            'from_result_counts': h.dolod_from_lod(
-                lod, metrics, 'result', (list_index_min, list_index_max)
+            'result_to_metric': h.dolod_from_lod(
+                lod, metrics, 'result', (TEST_RESULT_MIN, TEST_RESULT_MAX)
             ),
         }
 
@@ -367,6 +403,132 @@ class Evaluation:
                 json.dump(summary, f, indent=4)
 
         return summary
+
+
+    @classmethod
+    def from_summary(cls, summary):
+        """Reconstruct an :class:`Evaluation` from a serialized summary.
+
+        The summary can either be provided as a path to a JSON file or as a
+        JSON string. The expected format is the dictionary produced by
+        :meth:`result_summary`.
+
+        Parameters
+        ----------
+        summary : str or pathlib.Path
+            Either a path to a JSON file containing the serialized summary, or
+            a JSON string encoding the summary dictionary.
+
+        Returns
+        -------
+        Evaluation
+            The reconstructed evaluation instance.
+
+        Raises
+        ------
+        json.JSONDecodeError
+            If ``summary`` is not a valid JSON string.
+        KeyError
+            If required keys are missing from the summary.
+
+        Notes
+        -----
+        The returned evaluation contains the stored metadata and a population
+        of :class:`TestCase` objects reconstructed via :meth:`TestCase.from_dict`.
+        No diagrams are (re)computed.
+        """
+
+        path = Path(summary)
+        if path.is_file():
+            with open(path, 'r') as fp:
+                dictionary = json.load(fp)
+        else:
+            dictionary = json.loads(summary)
+
+        evaluation = cls()
+        evaluation.add_metadata(**dictionary['metadata'])
+        evaluation.add_test_cases(
+            [TestCase.from_dict(tc_dict) for tc_dict in dictionary['test_cases']]
+        )
+        return evaluation
+
+    def filter_test_cases(self, *,
+        test_result=None,
+        runtime=(None, None),
+        **metric_bounds
+    ):
+        """Filter the current population by result and metric bounds.
+
+        Parameters
+        ----------
+        test_result : TestResult or None, optional
+            If provided, only include test cases whose :attr:`~TestCase.result`
+            equals this value.
+        runtime : tuple[int, int], optional
+            Inclusive ``(lower, upper)`` bounds on the runtime (in
+            milliseconds). The runtime is taken as the runtime of the last
+            executed pipeline step, i.e. ``timing['runtimes'][max_step]``.
+        **metric_bounds
+            Additional metric bounds specified as keyword arguments
+            ``metric=(lower, upper)``.
+
+            Supported metric names are:
+
+            - ``'num_vars'``
+            - ``'num_gates'``
+            - ``'num_not_gates'``
+            - ``'num_and_gates'``
+            - ``'num_or_gates'``
+            - ``'num_xor_gates'``
+            - ``'expr_depth'``
+            - ``'num_literals'``
+
+            Bounds are interpreted inclusively.
+
+        Returns
+        -------
+        list[tuple[int, TestCase]]
+            List of ``(index, test_case)`` pairs for all test cases that satisfy
+            all provided constraints. The index refers to the 0-based position
+            in :attr:`population`.
+
+        Raises
+        ------
+        TypeError
+            If a metric name is unknown.
+        TypeError
+            If any bounds value is not a tuple/list of length 2.
+        """
+
+        get = {
+            'runtime': lambda tc: tc.timing['runtimes'] \
+                .get(max(tc.timing['runtimes'].keys(), default=0), 0),
+            'num_vars': lambda tc: tc.summary()['num_vars'],
+            'num_gates': lambda tc: tc.summary()['num_gates'],
+            'num_not_gates': lambda tc: tc.summary()['num_not_gates'],
+            'num_and_gates': lambda tc: tc.summary()['num_and_gates'],
+            'num_or_gates': lambda tc: tc.summary()['num_or_gates'],
+            'num_xor_gates': lambda tc: tc.summary()['num_xor_gates'],
+            'expr_depth': lambda tc: tc.summary()['expr_depth'],
+            'num_literals': lambda tc: tc.summary()['num_literals'],
+        }
+
+        def filter_func(i_tc_pair):
+            i, tc = i_tc_pair
+            if test_result and tc.result != test_result:
+                return False
+            metric_bounds['runtime'] = runtime
+            for metric, bounds in metric_bounds.items():
+                if metric not in get:
+                    raise TypeError(f'{metric} in an invalid metric name')
+                if not isinstance(bounds, (tuple, list)) or len(bounds) != 2:
+                    raise TypeError(f'Bounds for {metric} should be a tuple/list of length 2')
+                value, (lower, upper) = get[metric](tc), bounds
+                if (lower is not None and value < lower) or (upper is not None and value > upper):
+                    return False
+            return True
+
+        return list(filter(filter_func, enumerate(self.population)))
 
 
 class TestCase:
@@ -493,7 +655,59 @@ class TestCase:
         return self.__repr__()
 
     def to_dict(self):
-        return {'expr_string': self._expr_string, 'result': self._result.name}
+        """Serialize the test case to a dictionary.
+
+        Returns
+        -------
+        dict
+            Dictionary with the keys:
+
+            ``'expr_string'``
+                Canonical expression string.
+
+            ``'result'``
+                Name of the :class:`TestResult` value.
+
+            ``'timing'``
+                Timing metadata as returned by the :attr:`timing` property.
+        """
+        return {
+            'expr_string': self._expr_string,
+            'result': self._result.name,
+            'timing': self._timing,
+        }
+
+    @classmethod
+    def from_dict(cls, dictionary):
+        """Construct a :class:`TestCase` from a serialized representation.
+
+        Parameters
+        ----------
+        dictionary : dict
+            Dictionary as produced by :meth:`to_dict`.
+
+        Returns
+        -------
+        TestCase
+            The reconstructed test case.
+
+        Raises
+        ------
+        KeyError
+            If required keys are missing.
+        KeyError
+            If ``dictionary['result']`` is not a valid :class:`TestResult` name.
+
+        Notes
+        -----
+        Although the returned instance has set result and timing information,
+        the ZH-diagram and subsequent representations are not created.
+        """
+
+        tc = cls(dictionary['expr_string'])
+        tc._result = TestResult[dictionary['result']]
+        tc._timing = dictionary['timing']
+        return tc
 
 
     def create_zh(self):
@@ -748,9 +962,11 @@ class TestCase:
         )
 
         ax0 = fig.add_subplot(spec[0, 0:2])
-        setup_axes(ax0, 'Test case ' + self._expr_string)
+        expr_string = '$ ' + self._expr_string.replace('~', r'\neg ').replace('&', r'\wedge ') \
+            .replace('|', r'\vee ').replace('^', r'\oplus ') + ' $'
+        setup_axes(ax0, 'Test case ' + expr_string)
         ax0.text(0, 0, matrix_to_latex(self.expr_matrix),
-            usetex=True, size='large', ha='center', va='center')
+            usetex=True, size='large', ha='left', va='center')
 
         for i, (fig_i, latex_i, title) in enumerate(figs_latex):
             ax_fig = fig.add_subplot(spec[i+1, 0])
@@ -761,7 +977,7 @@ class TestCase:
 
             ax_latex = fig.add_subplot(spec[i+1, 1])
             setup_axes(ax_latex, 'Associated matrix:')
-            ax_latex.text(0, 0, latex_i, usetex=True, size='large', ha='center', va='center')
+            ax_latex.text(0, 0, latex_i, usetex=True, size='large', ha='left', va='center')
 
         if filepath:
             fig.savefig(filepath, bbox_inches='tight', pad_inches=0)
@@ -797,6 +1013,8 @@ class TestCase:
                 Number of ``Xor`` gates.
             ``expr_depth``
                 Maximum operator nesting depth.
+            ``num_literals``
+                Number of literal occurrences in the expression.
         """
 
         gate_counts = self._expr_sympy.gate_counts()
@@ -811,15 +1029,5 @@ class TestCase:
             'num_or_gates': gate_counts.get('Or', 0),
             'num_xor_gates': gate_counts.get('Xor', 0),
             'expr_depth': self._expr_sympy.depth(),
+            'num_literals': self._expr_sympy.num_literals(),
         }
-
-
-class TestResult(Enum):
-    INVALID = -2
-    UNDEFINED = -1
-    PASS = 0
-    # Positive integers indicate which step of the pipeline failed,
-    # e.g. FAIL1 means the first check failed
-    FAIL1 = 1
-    FAIL2 = 2
-    FAIL3 = 3

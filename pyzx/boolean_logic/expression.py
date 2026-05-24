@@ -143,6 +143,8 @@ class SymPyBooleanExpression:
 
         # Unify alternative operator representations
         alt_operators = {
+            r'(?<![\w])False(?![\w])': 'false',
+            r'(?<![\w])True(?![\w])': 'true',
             r'(?<![\w])0(?![\w])': 'false',
             r'(?<![\w])1(?![\w])': 'true',
             r'(?<![\w])not(?![\w])': '~',
@@ -223,3 +225,14 @@ class SymPyBooleanExpression:
 
         return count_depth(self._expr)
 
+
+    def num_literals(self):
+        """Count the number of literal occurrences in the expression.
+
+        Returns
+        -------
+        int
+            Total number of literal, i.e., symbol occurrences in the expression.
+        """
+
+        return sum(self._expr.count(symbol) for symbol in self.vars)
