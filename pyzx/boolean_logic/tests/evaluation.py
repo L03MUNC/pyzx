@@ -461,13 +461,14 @@ class Evaluation:
 
         Parameters
         ----------
-        test_result : TestResult or None, optional
-            If provided, only include test cases whose :attr:`~TestCase.result`
-            equals this value.
-        runtime : tuple[int, int], optional
-            Inclusive ``(lower, upper)`` bounds on the runtime (in
-            milliseconds). The runtime is taken as the runtime of the last
-            executed pipeline step, i.e. ``timing['runtimes'][max_step]``.
+        test_result : TestResult or list[TestResult] or None, optional
+            If given, only include test cases whose :attr:`~TestCase.result` is
+            in the provided value(s).
+        runtime : tuple[int or None, int or None] or dict[int, tuple[int or None, int or None]], optional
+            If a tuple, only include test cases whose runtime of the last stage is
+            within the given (lower, upper) bounds. If a dict, it is interpreted
+            as a mapping from stage index to (lower, upper) bounds on the runtime
+            of that respective stage.
         **metric_bounds
             Additional metric bounds specified as keyword arguments
             ``metric=(lower, upper)``.
@@ -515,9 +516,18 @@ class Evaluation:
 
         def filter_func(i_tc_pair):
             i, tc = i_tc_pair
-            if test_result and tc.result != test_result:
+            if test_result and tc.result not in test_result:
                 return False
-            metric_bounds['runtime'] = runtime
+            if isinstance(runtime, dict):
+                runtimes = tc.timing['runtimes']
+                for i in runtime:
+                    if i in runtimes:
+                        value, (lower, upper) = runtimes[i], runtime[i]
+                        if (lower is not None and value < lower) \
+                            or (upper is not None and value > upper):
+                            return False
+            else:
+                metric_bounds['runtime'] = runtime
             for metric, bounds in metric_bounds.items():
                 if metric not in get:
                     raise TypeError(f'{metric} in an invalid metric name')
@@ -528,6 +538,8 @@ class Evaluation:
                     return False
             return True
 
+        if test_result and isinstance(test_result, TestResult):
+            test_result = [test_result]
         return list(filter(filter_func, enumerate(self.population)))
 
 
