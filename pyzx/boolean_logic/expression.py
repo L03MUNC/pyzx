@@ -176,7 +176,7 @@ class SymPyBooleanExpression:
         Returns
         -------
         numpy.ndarray
-            Array of shape ``(2**n, 2)`` where ``n`` is the number of variables
+            Array of shape ``(2, 2**n)`` where ``n`` is the number of variables
             in the expression.
         """
 
