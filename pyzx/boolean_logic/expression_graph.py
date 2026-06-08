@@ -1,5 +1,9 @@
 import numpy as np
+from sympy.logic.boolalg import false, true
+from sympy.logic import SOPform
+from sympy import symbols
 
+from .expression import SymPyBooleanExpression
 from ..utils import EdgeType, VertexType, get_h_box_label, set_h_box_label
 from ..graph.graph_s import GraphS
 from ..simplify import to_gh, full_reduce
@@ -141,7 +145,7 @@ class LogicExpressionGraph(GraphS):
 
     @staticmethod
     def validate(graph):
-        """Validate whether a graph can be used as a logic expression.
+        """Validate whether a graph represents a logic expression.
 
         Parameters
         ----------
@@ -155,3 +159,33 @@ class LogicExpressionGraph(GraphS):
         """
 
         return graph.num_outputs() == 1
+
+
+    @staticmethod
+    def boolean_expression(graph):
+        """Extract the boolean expression represented by the graph.
+
+        Parameters
+        ----------
+        graph : GraphS
+            Graph to convert to a boolean expression.
+
+        Returns
+        -------
+        SymPyBooleanExpression
+            Boolean expression represented by the graph.
+        """
+
+        if not LogicExpressionGraph.validate(graph):
+            raise ValueError('Graph does not represent a logic expression.')
+
+        tol = 0.25
+        boolean_output = [int(np.abs(out) >= tol) for out in graph.to_matrix()[1]]
+        if boolean_output == [0]:
+            return SymPyBooleanExpression(false)
+        if boolean_output == [1]:
+            return SymPyBooleanExpression(true)
+        variables = symbols(f'x_0:{graph.num_inputs()}')
+        minterms = np.nonzero(boolean_output)[0].astype(int).tolist()
+        sympy_expr = SOPform(variables, minterms)
+        return SymPyBooleanExpression(sympy_expr)
