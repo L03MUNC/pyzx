@@ -455,12 +455,18 @@ class Evaluation:
         No diagrams are (re)computed.
         """
 
+        def int_keys_hook(dictionary):
+            return {
+                int(key) if key.isdigit() else key: val
+                for key, val in dictionary.items()
+            }
+
         path = Path(summary)
         if path.is_file():
             with open(path, 'r') as fp:
-                dictionary = json.load(fp)
+                dictionary = json.load(fp, object_hook=int_keys_hook)
         else:
-            dictionary = json.loads(summary)
+            dictionary = json.loads(summary, object_hook=int_keys_hook)
 
         evaluation = cls()
         evaluation.add_metadata(**dictionary['metadata'])
@@ -858,6 +864,7 @@ class TestCase:
 
         h.printv(f'Running test case: {self._expr_string}', verbosity=verbosity, level=1)
         self._result = TestResult.PASS
+        self._timing['timeout'] = False
         for i, (act, assert_) in enumerate(pipeline):
             h.printv(f'\tRunning step {i+1}: {act.__name__}', verbosity=verbosity, level=2)
             t0 = perf_counter()
