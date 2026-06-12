@@ -3,6 +3,7 @@ import sys
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 
 
 def printv(*args, verbosity, level, **kwargs):
@@ -204,6 +205,8 @@ def plot_metric_counts(ax, lod, metric, result_names):
     ax.set_title(f'Number of occurrences versus {metric}')
     ax.set_xlabel(metric)
     ax.set_ylabel('Number of occurrences')
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
 
 def plot_multiple_metric_counts(dolod, result_names, figsize=[6.4, 4.8], filepath=None):
     """Plot metric counts in separate figures.
@@ -277,7 +280,7 @@ def plot_composed_metric_counts(dolod, result_names, component_figsize=[6.4, 4.8
         fig.savefig(filepath)
     return fig, axes_flat
 
-def plot_runtimes_ecdf(ax, runtimes, result_names):
+def plot_runtimes_ecdf(ax, runtimes, result_names, title='ECDF of runtimes'):
     """Plot empirical CDFs (ECDFs) of runtimes per result category.
 
     Parameters
@@ -289,6 +292,8 @@ def plot_runtimes_ecdf(ax, runtimes, result_names):
         result category and is paired with ``result_names``.
     result_names : sequence of str
         Labels for the different result categories.
+    title : str, optional
+        Title for the plot.
 
     Returns
     -------
@@ -299,11 +304,11 @@ def plot_runtimes_ecdf(ax, runtimes, result_names):
         if vals:
             ax.ecdf(vals, label=result)
     ax.legend()
-    ax.set_title('ECDF of runtimes')
+    ax.set_title(title)
     ax.set_xlabel('Runtime (ms)')
     ax.set_ylabel('Cumulative probability')
 
-def plot_runtimes_ecdf_fig(runtimes, result_names, figsize=[6.4, 4.8], filepath=None):
+def plot_runtimes_ecdf_fig(runtimes, result_names, figsize=[6.4, 4.8], title='ECDF of runtimes', filepath=None):
     """Create a new figure and plot ECDFs of runtimes.
 
     Parameters
@@ -315,6 +320,8 @@ def plot_runtimes_ecdf_fig(runtimes, result_names, figsize=[6.4, 4.8], filepath=
         Labels for the different result categories.
     figsize : list[float, float], optional
         Figure size passed to :func:`matplotlib.pyplot.subplots`.
+    title : str, optional
+        Title for the plot.
     filepath : str or pathlib.Path, optional
         If provided, save the figure via ``fig.savefig``.
 
@@ -325,7 +332,7 @@ def plot_runtimes_ecdf_fig(runtimes, result_names, figsize=[6.4, 4.8], filepath=
     """
 
     fig, ax = plt.subplots(figsize=figsize)
-    plot_runtimes_ecdf(ax, runtimes, result_names)
+    plot_runtimes_ecdf(ax, runtimes, result_names, title=title)
     if filepath:
         fig.savefig(filepath)
     return fig, ax

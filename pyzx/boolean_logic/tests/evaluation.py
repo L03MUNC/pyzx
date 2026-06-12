@@ -276,7 +276,8 @@ class Evaluation:
                     'timing': {
                         'avg_runtimes': list[int],
                         'timeout_fractions': list[float],
-                        'result_to_runtime': list[list[int]],
+                        'result_to_runtimes': list[list[list[int]]],
+                        'result_to_avg_runtimes': list[list[int]],
                     },
                     'result_counts': list[int],
                     'result_fractions': list[float],
@@ -307,10 +308,12 @@ class Evaluation:
                     Fractions of timeouts per :class:`TestResult` bucket.
                     Entries align with ``result_enum``.
 
-                ``timing['result_to_runtime']``
-                    List of lists of runtimes (in milliseconds) of the last executed
-                    step of each test case, grouped by :class:`TestResult` value.
-                    Outer list aligns with ``result_enum``.
+                ``timing['result_to_runtimes']``
+                    List of runtimes of each step per :class:`TestResult` bucket.
+
+                ``timing['result_to_avg_runtimes']``
+                    List of average runtimes of each step per :class:`TestResult`
+                    bucket.
 
             ``result_counts``
                 Counts per :class:`TestResult` value.
@@ -363,9 +366,22 @@ class Evaluation:
             round(count / result_counts[i], 2) if result_counts[i] > 0 else 0.0
             for i, count in enumerate(timeout_counts)
         ]
-        result_to_runtime = [list() for _ in range(list_len)]
+        result_to_runtimes = [list() for _ in range(list_len)]
         for tc, runtime in zip(lod, runtimes):
-            result_to_runtime[tc['result'] - TEST_RESULT_MIN].append(runtime[-1])
+            result_to_runtimes[tc['result'] - TEST_RESULT_MIN].append(runtime)
+        result_to_avg_runtimes = list()
+        for result in result_to_runtimes:
+            if result:
+                steps = max(len(tc) for tc in result)
+                runtimes = [
+                    tc + [np.nan] * (steps - len(tc))
+                    for tc in result
+                ]
+                result_to_avg_runtimes.append(
+                    np.nanmean(runtimes, axis=0).astype(int).tolist()
+                )
+            else:
+                result_to_avg_runtimes.append(list())
 
         summary = {
             'metadata': self._metadata,
@@ -374,7 +390,8 @@ class Evaluation:
             'timing': {
                 'avg_runtimes': avg_runtimes,
                 'timeout_fractions': timeout_fractions,
-                'result_to_runtime': result_to_runtime,
+                'result_to_runtimes': result_to_runtimes,
+                'result_to_avg_runtimes': result_to_avg_runtimes,
             },
             'result_counts': result_counts,
             'result_fractions': result_fractions,
@@ -451,6 +468,7 @@ class Evaluation:
             [TestCase.from_dict(tc_dict) for tc_dict in dictionary['test_cases']]
         )
         return evaluation
+
 
     def filter_test_cases(self, *,
         test_result=None,
