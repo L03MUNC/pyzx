@@ -29,12 +29,14 @@ if __name__ == '__main__':
 from pyzx.graph import Graph
 from pyzx.circuit import Circuit
 from pyzx.circuit.qasmparser import qasm
+from pyzx.symbolic import Poly
 from fractions import Fraction
 from pyzx.generate import cliffordT
 from pyzx.simplify import *
 from pyzx.simplify import supplementarity_simp, to_clifford_normal_form_graph, copy_simp
 from pyzx import compare_tensors
 from pyzx.generate import cliffordT
+from tests import STEANE_X_STABILISER_QASM
 
 np: Optional[ModuleType]
 try:
@@ -155,6 +157,203 @@ class TestSimplify(unittest.TestCase):
 
     def test_pivot_simp(self):
         self.func_test(pivot_simp,prepare=[spider_simp,to_gh,spider_simp])
+
+    def test_match_pivot_boundary_skips_grounded_neighbor(self):
+        """Regression test that ``match_pivot_boundary`` skips a Pauli
+        candidate whose neighbour is grounded."""
+        from pyzx import EdgeType
+        from pyzx.rewrite_rules.pivot_rule import match_pivot_boundary
+        g = Graph()
+        b = g.add_vertex(VertexType.BOUNDARY, qubit=0, row=0)
+        w = g.add_vertex(VertexType.Z, qubit=0, row=1, phase=Fraction(1, 2))
+        v = g.add_vertex(VertexType.Z, qubit=0, row=2, phase=Fraction(1))
+        g.add_edge((b, w), EdgeType.SIMPLE)
+        g.add_edge((w, v), EdgeType.HADAMARD)
+        g.set_inputs([b])
+        g.set_ground(w, True)
+
+        # The only candidate `v` has the grounded `w` as a neighbour.
+        vertex_count_before = len(list(g.vertices()))
+        self.assertEqual(match_pivot_boundary(g), [])
+        self.assertEqual(len(list(g.vertices())), vertex_count_before)
+
+    def _make_boundary_pivot_graph(self):
+        """Build a boundary-pivot configuration: interior Pauli ``v``
+        adjacent to non-Pauli ``w`` with exactly one boundary neighbour."""
+        from pyzx import EdgeType
+        g = Graph()
+        b_in = g.add_vertex(VertexType.BOUNDARY, qubit=0, row=0)
+        w = g.add_vertex(VertexType.Z, qubit=0, row=1, phase=Fraction(1, 4))
+        v = g.add_vertex(VertexType.Z, qubit=0, row=2, phase=Fraction(1))
+        x = g.add_vertex(VertexType.Z, qubit=0, row=3, phase=Fraction(1, 2))
+        b_out = g.add_vertex(VertexType.BOUNDARY, qubit=0, row=4)
+        g.add_edge((b_in, w), EdgeType.SIMPLE)
+        g.add_edge((w, v), EdgeType.HADAMARD)
+        g.add_edge((v, x), EdgeType.HADAMARD)
+        g.add_edge((x, b_out), EdgeType.SIMPLE)
+        g.set_inputs([b_in])
+        g.set_outputs([b_out])
+        return g, v, w
+
+    def _make_gadget_pivot_graph(self):
+        """Build a gadget-pivot configuration matching the example diagram
+        in issue #413: interior Pauli ``v`` adjacent to interior non-Pauli
+        ``w``, each with two boundary-adjacent neighbours plus two shared
+        boundary-adjacent neighbours."""
+        from pyzx import EdgeType
+        g = Graph()
+        v = g.add_vertex(VertexType.Z, qubit=2, row=2, phase=Fraction(1))
+        w = g.add_vertex(VertexType.Z, qubit=3, row=2, phase=Fraction(1, 4))
+
+        # Two boundary-adjacent neighbours of v only (the "a_i" in the issue).
+        a1 = g.add_vertex(VertexType.Z, qubit=0, row=1)
+        ba1 = g.add_vertex(VertexType.BOUNDARY, qubit=0, row=0)
+        a2 = g.add_vertex(VertexType.Z, qubit=1, row=1)
+        ba2 = g.add_vertex(VertexType.BOUNDARY, qubit=1, row=0)
+        g.add_edge((v, a1), EdgeType.HADAMARD)
+        g.add_edge((a1, ba1), EdgeType.SIMPLE)
+        g.add_edge((v, a2), EdgeType.HADAMARD)
+        g.add_edge((a2, ba2), EdgeType.SIMPLE)
+
+        # Two boundary-adjacent neighbours of w only (the "c_i" in the issue).
+        c1 = g.add_vertex(VertexType.Z, qubit=4, row=3)
+        bc1 = g.add_vertex(VertexType.BOUNDARY, qubit=4, row=4)
+        c2 = g.add_vertex(VertexType.Z, qubit=5, row=3)
+        bc2 = g.add_vertex(VertexType.BOUNDARY, qubit=5, row=4)
+        g.add_edge((w, c1), EdgeType.HADAMARD)
+        g.add_edge((c1, bc1), EdgeType.SIMPLE)
+        g.add_edge((w, c2), EdgeType.HADAMARD)
+        g.add_edge((c2, bc2), EdgeType.SIMPLE)
+
+        # Two shared boundary-adjacent neighbours (the "b_i" in the issue).
+        b1 = g.add_vertex(VertexType.Z, qubit=2, row=3)
+        bb1 = g.add_vertex(VertexType.BOUNDARY, qubit=2, row=4)
+        b2 = g.add_vertex(VertexType.Z, qubit=3, row=3)
+        bb2 = g.add_vertex(VertexType.BOUNDARY, qubit=3, row=4)
+        g.add_edge((v, b1), EdgeType.HADAMARD)
+        g.add_edge((w, b1), EdgeType.HADAMARD)
+        g.add_edge((b1, bb1), EdgeType.SIMPLE)
+        g.add_edge((v, b2), EdgeType.HADAMARD)
+        g.add_edge((w, b2), EdgeType.HADAMARD)
+        g.add_edge((b2, bb2), EdgeType.SIMPLE)
+
+        g.add_edge((v, w), EdgeType.HADAMARD)
+        g.set_inputs([ba1, ba2])
+        g.set_outputs([bb1, bb2, bc1, bc2])
+        return g, v, w
+
+    def test_pivot_boundary_simp_apply(self):
+        """Regression test for issue #413: ``pivot_boundary_simp.apply``
+        matches an interior Pauli vertex paired with a non-Pauli vertex
+        with exactly one boundary neighbour and preserves the tensor.
+        Also exercises the row-index fallback when ``w`` has no explicit
+        row."""
+        g, v, w = self._make_boundary_pivot_graph()
+        self.assertTrue(pivot_boundary_simp.is_match(g, v, w))
+        self.assertFalse(pivot_boundary_simp.is_match(g, w, v))
+
+        t = g.to_tensor()
+        self.assertTrue(pivot_boundary_simp.apply(g, v, w))
+        self.assertTrue(compare_tensors(t, g.to_tensor(), preserve_scalar=True))
+
+        # Graph constructed without an explicit row index for ``w``.
+        g, v, w = self._make_boundary_pivot_graph()
+        del g._rindex[w]
+        self.assertTrue(pivot_boundary_simp.apply(g, v, w))
+
+    def test_pivot_gadget_simp_apply(self):
+        """Regression test for issue #413: ``pivot_gadget_simp.apply``
+        matches an interior Pauli vertex paired with an interior non-Pauli
+        vertex and preserves the tensor. Also exercises the row-index
+        fallback when ``v`` and ``w`` have no explicit rows."""
+        g, v, w = self._make_gadget_pivot_graph()
+        self.assertTrue(pivot_gadget_simp.is_match(g, v, w))
+        self.assertFalse(pivot_gadget_simp.is_match(g, w, v))
+        # The boundary pivot rule should not match this configuration.
+        self.assertFalse(pivot_boundary_simp.is_match(g, v, w))
+
+        t = g.to_tensor()
+        self.assertTrue(pivot_gadget_simp.apply(g, v, w))
+        self.assertTrue(compare_tensors(t, g.to_tensor(), preserve_scalar=True))
+
+        # Graph constructed without explicit row indices for ``v`` and ``w``.
+        g, v, w = self._make_gadget_pivot_graph()
+        del g._rindex[v]
+        del g._rindex[w]
+        self.assertTrue(pivot_gadget_simp.apply(g, v, w))
+
+    def test_pivot_gadget_simp_apply_alignment(self):
+        """Test that ``pivot_gadget_simp.apply`` mirrors the placement and
+        qubit handling done by ``match_pivot_gadget``: the new gadget vertex
+        sits at qubit -2 on the row of the Pauli vertex, and the Pauli vertex
+        is moved to qubit -1."""
+        g, v, w = self._make_gadget_pivot_graph()
+        pauli_row = g.row(v)
+        vertices_before = set(g.vertices())
+        self.assertTrue(pivot_gadget_simp.apply(g, v, w))
+
+        self.assertEqual(g.qubit(v), -1)
+        new_vertices = set(g.vertices()) - vertices_before
+        gadget_vs = [u for u in new_vertices
+                     if g.qubit(u) == -2 and g.row(u) == pauli_row]
+        self.assertEqual(len(gadget_vs), 1)
+
+    def test_pivot_boundary_simp_negative_matches(self):
+        """Test that ``pivot_boundary_simp.is_match`` rejects invalid configurations."""
+        from pyzx import EdgeType
+        g = Graph()
+        b_in = g.add_vertex(VertexType.BOUNDARY, qubit=0, row=0)
+        w = g.add_vertex(VertexType.Z, qubit=0, row=1, phase=Fraction(1, 4))
+        v = g.add_vertex(VertexType.Z, qubit=0, row=2, phase=Fraction(1))
+        b_out = g.add_vertex(VertexType.BOUNDARY, qubit=0, row=3)
+        g.add_edge((b_in, w), EdgeType.SIMPLE)
+        g.add_edge((w, v), EdgeType.HADAMARD)
+        g.add_edge((v, b_out), EdgeType.SIMPLE)
+        g.set_inputs([b_in])
+        g.set_outputs([b_out])
+
+        # v has a boundary neighbour, so the rule should not match.
+        self.assertFalse(pivot_boundary_simp.is_match(g, v, w))
+
+        # Both Pauli; this is a regular pivot match, not a boundary pivot.
+        g2 = Graph()
+        b2 = g2.add_vertex(VertexType.BOUNDARY, qubit=0, row=0)
+        w2 = g2.add_vertex(VertexType.Z, qubit=0, row=1, phase=Fraction(1))
+        v2 = g2.add_vertex(VertexType.Z, qubit=0, row=2, phase=Fraction(1))
+        g2.add_edge((b2, w2), EdgeType.SIMPLE)
+        g2.add_edge((w2, v2), EdgeType.HADAMARD)
+        g2.set_inputs([b2])
+        self.assertFalse(pivot_boundary_simp.is_match(g2, v2, w2))
+
+    def test_pivot_gadget_simp_negative_matches(self):
+        """Test that ``pivot_gadget_simp.is_match`` rejects invalid configurations."""
+        from pyzx import EdgeType
+        # w is a phase gadget (degree 1), should not match.
+        g = Graph()
+        v = g.add_vertex(VertexType.Z, qubit=0, row=0, phase=Fraction(1))
+        w = g.add_vertex(VertexType.Z, qubit=0, row=1, phase=Fraction(1, 4))
+        n = g.add_vertex(VertexType.Z, qubit=1, row=0)
+        bn = g.add_vertex(VertexType.BOUNDARY, qubit=1, row=1)
+        g.add_edge((v, w), EdgeType.HADAMARD)
+        g.add_edge((v, n), EdgeType.HADAMARD)
+        g.add_edge((n, bn), EdgeType.SIMPLE)
+        g.set_outputs([bn])
+        self.assertFalse(pivot_gadget_simp.is_match(g, v, w))
+
+        # v has a boundary neighbour, so v is not interior.
+        g2 = Graph()
+        b = g2.add_vertex(VertexType.BOUNDARY, qubit=0, row=0)
+        v2 = g2.add_vertex(VertexType.Z, qubit=0, row=1, phase=Fraction(1))
+        w2 = g2.add_vertex(VertexType.Z, qubit=0, row=2, phase=Fraction(1, 4))
+        n2 = g2.add_vertex(VertexType.Z, qubit=1, row=2)
+        bn2 = g2.add_vertex(VertexType.BOUNDARY, qubit=1, row=3)
+        g2.add_edge((b, v2), EdgeType.SIMPLE)
+        g2.add_edge((v2, w2), EdgeType.HADAMARD)
+        g2.add_edge((w2, n2), EdgeType.HADAMARD)
+        g2.add_edge((n2, bn2), EdgeType.SIMPLE)
+        g2.set_inputs([b])
+        g2.set_outputs([bn2])
+        self.assertFalse(pivot_gadget_simp.is_match(g2, v2, w2))
 
     def test_lcomp_simp(self):
         self.func_test(lcomp_simp,prepare=[spider_simp,to_gh,spider_simp])
@@ -280,6 +479,100 @@ class TestSimplify(unittest.TestCase):
         self.assertTrue(g.num_vertices() == g1.num_vertices())
         self.assertTrue(compare_tensors(g1.to_tensor(),g.to_tensor()))
 
+    def test_measurement_outcomes_survive_reduction(self):
+        """Symbolic measurement outcomes must survive full_reduce.
+
+        Regression test for tqec/tqec#528. In a circuit with mid-circuit
+        resets, the measurement outcome must be on a separate leaf off the
+        qubit wire so that the subsequent reset traces out only the
+        post-measurement quantum state, not the classical result.
+        """
+        c = Circuit.from_qasm(STEANE_X_STABILISER_QASM)
+        g = c.to_graph()
+        full_reduce(g)
+
+        # Collect measurement-outcome vertices by phase label, keeping
+        # all matches so duplicate labels can be detected. Filter to
+        # ``Poly`` phases since numeric phases (``int``/``Fraction``)
+        # introduced by ``full_reduce`` would otherwise be misclassified
+        # as outcomes; reset variables (``_rN``) are also excluded.
+        outcome_verts: dict = {}
+        for v in g.vertices():
+            p = g.phase(v)
+            if not isinstance(p, Poly):
+                continue
+            ps = str(p)
+            if ps.startswith('_r'):
+                continue
+            outcome_verts.setdefault(ps, []).append(v)
+
+        for label in ('c[0]', 'c[1]', 'c[2]'):
+            self.assertEqual(len(outcome_verts.get(label, [])), 1,
+                f"expected exactly one outcome vertex for {label}, "
+                f"got {len(outcome_verts.get(label, []))}")
+        self.assertEqual(sorted(outcome_verts.keys()), ['c[0]', 'c[1]', 'c[2]'],
+            "full_reduce destroyed measurement outcome phases")
+
+        # Verify stabiliser connectivity: each outcome spider should
+        # be connected (via Z neighbours) to exactly the data qubits
+        # of the corresponding Steane X-stabiliser.
+        expected_data_qubits = {
+            'c[0]': {1, 2, 3, 4},
+            'c[1]': {1, 2, 5, 6},
+            'c[2]': {1, 3, 5, 7},
+        }
+        output_qubit = {v: int(g.qubit(v)) for v in g.outputs()}
+        for label, vs in outcome_verts.items():
+            v = vs[0]
+            data_qubits = set()
+            for n in g.neighbors(v):
+                if g.type(n) == VertexType.BOUNDARY and n in g.inputs():
+                    continue  # Ancilla input, not a data qubit.
+                # Follow through to the output boundary to find the qubit.
+                for nn in g.neighbors(n):
+                    if nn in output_qubit:
+                        data_qubits.add(output_qubit[nn])
+            self.assertEqual(data_qubits, expected_data_qubits[label],
+                f"{label} stabiliser has wrong data-qubit connectivity")
+
+    def test_measurement_outcomes_survive_minimal_ancilla(self):
+        """Minimal measure-reset-measure pattern keeps both outcomes.
+
+        Two-qubit reduction of tqec/tqec#528: ``q[0]`` is reused as a
+        parity-check ancilla against the data qubit ``q[1]``, so both
+        outcomes are entangled with the data wire and must survive
+        ``full_reduce``.
+        """
+        c = Circuit.from_qasm("""
+        OPENQASM 2.0;
+        include "qelib1.inc";
+        qreg q[2];
+        creg c[2];
+        h q[0];
+        cx q[0], q[1];
+        measure q[0] -> c[0];
+        reset q[0];
+        h q[0];
+        cx q[0], q[1];
+        measure q[0] -> c[1];
+        """)
+        g = c.to_graph()
+        full_reduce(g)
+
+        # Both c[0] and c[1] must appear in a remaining symbolic phase
+        # (possibly XOR-combined in a single Poly, e.g. ``c[0] + c[1]``,
+        # since the CNOT couples the outcomes). Filter to ``Poly``
+        # phases to avoid misclassifying numeric ``Fraction`` phases as
+        # outcomes; reset variables (``_rN``) are also excluded.
+        joined = " | ".join(
+            str(g.phase(v)) for v in g.vertices()
+            if isinstance(g.phase(v), Poly)
+            and not str(g.phase(v)).startswith('_r')
+        )
+        self.assertIn('c[0]', joined,
+            "full_reduce destroyed c[0] outcome phase")
+        self.assertIn('c[1]', joined,
+            "full_reduce destroyed c[1] outcome phase")
 
 
 qasm_1 = """OPENQASM 2.0;

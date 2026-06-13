@@ -9,7 +9,14 @@ Hence, occasionally changes will be backwards incompatible (although they will a
 ## [Unreleased]
 
 ### Added
+- Added the "magic cat" decomposition strategy from https://arxiv.org/pdf/2202.09202 (which previously only existed in Quizx). (by @mjsutcliffe99).
+
+## [0.10.3] - 2026-06-01
+
+### Added
 - The circuit generation functions in pyzx.generate now accept an additional optional argument, sigma, allowing a CNOT spread based on a Gaussian distribution rather than a uniform distribution for control over how localised the CNOTs should be. (by @mjsutcliffe99).
+- `pyzx.simplify.drop_orphan_reset_discards`: opt-in cleanup pass that removes the disconnected `boundary -- Z(0) -- X(_rN)` components left behind by `Circuit.to_graph(elide_initial_resets=False)` on circuits with leading resets, matching the elided graph with |0⟩ applied to those inputs (by @dlyongemallo).
+
 
 ### Deprecated
 - Deprecated pyzx.simulate.py as it is starting to get bloated with all the new decompositions and strategies that have been added in recent years. All the functions in this file should still work (with deprecation warnings) but are rerouted to their new homes under the pyzx.simulation folder. (by @mjsutcliffe99).
@@ -17,9 +24,12 @@ Hence, occasionally changes will be backwards incompatible (although they will a
 ### Changed
 - Refactored the simulation API to make it more formulaic and extensible. Individual decompositions are no longer included as distinct functions inside pyzx.simulate.py but now are provided their own individual files under pyzx.simulation.decompositions and share a common caller function. For example, pyzx.simulate.apply_cat3(g,v) is instead now pyzx.simulation.apply_decomp(Decomp.CAT_3,g,v), etc. (by @mjsutcliffe99).
 - Likewise, decomposition strategies are separated into individual files under pyzx.simulation.strategies and called similarly through e.g. zx.simulation.full_decompose(Strategy.BSS,g). (by @mjsutcliffe99).
+- `pivot_boundary_simp` and `pivot_gadget_simp` are now `RewriteSimpDoubleVertex` instances (previously `RewriteSimpGraph`), so their `is_match` and `apply` methods take two vertices `(v, w)` rather than a `List[VT]`. Whole-graph simplification (calling them as a function or via `simp()`) is unchanged. This is a breaking change for code that relied on the old `apply(graph, vertices)` signature. (by @dlyongemallo)
 
 ### Fixed
 - Multigraph handling of parallel mixed simple/Hadamard edges in tensor contraction, several rewrite rules, and `PauliWeb` (by @dlyongemallo).
+- Reset gate representation changed from ground-based to symbolic boolean paradigm, avoiding paradigm-mixing issues that destroyed measurement phases during simplification of circuits with mid-circuit resets. As a side effect, `graph_to_circuit` now recovers conditional X-type rotations (`NOT`, `XPhase`, `SX`), since X-type vertices on the qubit wire are unambiguous now that measurement outcomes are represented as leaves. `Circuit.to_graph` gains an opt-in `elide_initial_resets` flag (default `False`) that skips the discard chain for a `Reset` on an unmodified input wire, useful for circuits with OpenQASM-style implicit |0⟩ inputs. Each `_rN` reset variable is allocated to the lowest name not already in the graph's variable registry to avoid aliasing user-supplied phases, and `graph_to_circuit` excludes vertices on classical-bit wires (e.g. the `Z`/`X` pair from `DiscardBit`) so hybrid graphs round-trip without extra phantom qubits (by @dlyongemallo).
+- The boundary and gadget pivot rules now correctly match the `(P2)` and `(P3)` rules in the paper [arXiv:1903.10477](https://doi.org/10.1103/PhysRevA.102.022406) when applied manually, e.g., from ZXLive (by @dlyongemallo).
 
 ## [0.10.2] - 2026-05-01
 
