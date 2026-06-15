@@ -155,10 +155,13 @@ class LogicExpressionGraph(GraphS):
         Returns
         -------
         bool
-            ``True`` if the graph has exactly one output.
+            ``True`` if the graph has exactly one output and the output is
+            Boolean (i.e., its matrix entry is close to either 0 or 1).
         """
 
-        return graph.num_outputs() == 1
+        tol = 0.25
+        matrix = np.abs(graph.to_matrix())
+        return graph.num_outputs() == 1 and np.abs(matrix[1] - matrix[0]) >= 2 * tol
 
 
     @staticmethod
@@ -180,7 +183,7 @@ class LogicExpressionGraph(GraphS):
             raise ValueError('Graph does not represent a logic expression.')
 
         tol = 0.25
-        boolean_output = [int(np.abs(out) >= tol) for out in graph.to_matrix()[1]]
+        boolean_output = (np.abs(graph.to_matrix()[1]) >= tol).astype(int).tolist()
         if boolean_output == [0]:
             return SymPyBooleanExpression(false)
         if boolean_output == [1]:
